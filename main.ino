@@ -10,11 +10,9 @@
 #include "wifi_structures.h"
 #include "debug.h"
 
-// Bao gồm FreeRTOS (nếu SDK BW16 đã tích hợp FreeRTOS)
 #include <FreeRTOS.h>
 #include <task.h>
 
-// Nếu LED đã được định nghĩa trong variant thì không định nghĩa lại
 #ifndef LED_R
   #define LED_R 2
 #endif
@@ -25,14 +23,13 @@
   #define LED_B 4
 #endif
 
-// --------------------------------------------------
 // Các trạng thái của mạch
 enum DeviceState {
   STATE_IDLE,         // Chỉ AP hoạt động
   STATE_SCANNING,     // Đang quét mạng
   STATE_ATTACK,       // Đang tấn công deauth
-  STATE_BEACON,       // Đang phát Beacon (nhái)
-  STATE_BEACON_FLOOD  // Mới: Đang thực hiện Beacon Flood
+  STATE_BEACON,       // Đang phát Beacon
+  STATE_BEACON_FLOOD  // Đang thực hiện Beacon Flood
 };
 
 volatile DeviceState currentState = STATE_IDLE;  // volatile vì được truy cập từ nhiều task
@@ -40,10 +37,9 @@ volatile DeviceState currentState = STATE_IDLE;  // volatile vì được truy c
 // Các hằng số LED pattern (millisecond)
 const unsigned long BLINK_INTERVAL_ATTACK       = 1000;
 const unsigned long BLINK_INTERVAL_SCANNING     = 500;
-const unsigned long BLINK_INTERVAL_BEACON       = 1000; // LED nhấp nháy khi phát beacon (nhái)
+const unsigned long BLINK_INTERVAL_BEACON       = 1000; // LED nhấp nháy khi phát beacon
 const unsigned long BLINK_INTERVAL_BEACON_FLOOD = 200;  // LED nhấp nháy khi beacon flood
 
-// --------------------------------------------------
 // Cấu trúc lưu trữ kết quả quét WiFi
 struct WiFiScanResult {
   String ssid;
