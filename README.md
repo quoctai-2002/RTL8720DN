@@ -60,8 +60,6 @@
    Clone repository từ GitHub:
    ```bash
    git clone https://github.com/quoctai-2002/RTL8720DN.git
-   ```
-   
 3. **Mở dự án trong Arduino IDE:**  
    Mở tập tin `main.cpp` (hoặc file `.ino` nếu dự án được định dạng như vậy).
 
