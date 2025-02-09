@@ -2,8 +2,6 @@
 ```markdown
 # RTL8720DN Deauther
 
-![License](https://img.shields.io/badge/license-Apache%202.0-blue)
-
 ## Giới thiệu
 
 **RTL8720DN Deauther** là một dự án mã nguồn mở được xây dựng trên chip RTL8720DN (Ameba) với mục tiêu trình diễn các kỹ thuật tấn công deauthentication và beacon flooding trên mạng WiFi. Dự án này được phát triển bằng C/C++ với Arduino framework, sử dụng FreeRTOS để quản lý các tác vụ song song và các API WiFi của RTL8720DN SDK.
