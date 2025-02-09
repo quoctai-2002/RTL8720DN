@@ -30,7 +30,7 @@
 
 ## Cấu trúc dự án
 
-- **main.cpp:**  
+- **main.ino:**  
   Tập tin chính chứa hàm `setup()` và `loop()`, khởi tạo WiFi AP, quét mạng ban đầu và tạo các task FreeRTOS.
 
 - **wifi_conf.h, wifi_cust_tx.h, wifi_util.h, wifi_structures.h:**  
