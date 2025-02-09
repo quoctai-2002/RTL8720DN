@@ -28,11 +28,6 @@ typedef struct {
   uint8_t ssid[255];
 } BeaconFrame;
 
-/*
- * Import the needed c functions from the closed-source libraries
- * The function definitions might not be 100% accurate with the arguments as the types get lost during compilation and cannot be retrieved back during decompilation
- * However, these argument types seem to work perfect
-*/
 extern uint8_t* rltk_wlan_info;
 extern "C" void* alloc_mgtxmitframe(void* ptr);
 extern "C" void update_mgntframe_attrib(void* ptr, void* frame_control);
