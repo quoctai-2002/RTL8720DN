@@ -39,7 +39,7 @@ volatile DeviceState currentState = STATE_IDLE;  // volatile vì được truy c
 // Các hằng số LED pattern (millisecond)
 const unsigned long BLINK_INTERVAL_IDLE  = 1500;
 const unsigned long BLINK_INTERVAL_ATTACK  = 1000;
-const unsigned long BLINK_INTERVAL_SCANNING = 200;
+const unsigned long BLINK_INTERVAL_SCANNING = 100;
 const unsigned long BLINK_INTERVAL_BEACON   = 1000; // ví dụ: LED nhấp nháy theo chế độ beacon
 
 // --------------------------------------------------
@@ -80,7 +80,7 @@ uint16_t deauth_reason = DEFAULT_DEAUTH_REASON;
 // Thay vì dùng hằng số chung, ta tách riêng số frame cho mỗi băng:
 #define FRAMES_PER_DEAUTH_24 5    // số frame deauth gửi cho băng 2.4GHz
 #define FRAMES_PER_DEAUTH_5  10    // số frame deauth gửi cho băng 5GHz
-#define FRAMES_PER_BEACON    200   // số frame beacon gửi mỗi lần
+#define FRAMES_PER_BEACON    250   // số frame beacon gửi mỗi lần
 
 // --------------------------------------------------
 // Các khoảng thời gian riêng cho tấn công từng băng (ms)
@@ -265,7 +265,7 @@ void handleRoot(WiFiClient &client) {
   <body>
     <div class="container">
       <header>
-        <h1>RTL8720DN Deauther</h1>
+        <h1>RTL8720DN BW16</h1>
       </header>
       <main>
         <form method="post" action="/action">
@@ -286,7 +286,7 @@ void handleRoot(WiFiClient &client) {
   for (uint32_t i = 0; i < scan_results.size(); i++) {
     String display_ssid = scan_results[i].ssid;
     if (display_ssid.length() == 0) {
-      display_ssid = "☠ʜɪᴅᴅᴇɴ ᴡɪꜰɪ☠";
+      display_ssid = "✪ ʜɪᴅᴅᴇɴ ᴡɪꜰɪ ✪";
     }
     response += "<tr>";
     response += "<td><input type='checkbox' name='network' value='" + String(i) + "'></td>";
