@@ -31,7 +31,7 @@ enum DeviceState {
   STATE_IDLE,     // Chỉ AP hoạt động
   STATE_SCANNING, // Đang quét mạng
   STATE_ATTACK,   // Đang tấn công deauth
-  STATE_BEACON    // Đang phát Beacon (nhái)
+  STATE_BEACON    // Đang phát Beacon
 };
 
 volatile DeviceState currentState = STATE_IDLE;  // volatile vì được truy cập từ nhiều task
@@ -62,11 +62,11 @@ int current_channel = 12;
 // Danh sách kết quả quét
 std::vector<WiFiScanResult> scan_results;
 
-// Các vector lưu các mục tiêu tấn công (dùng cho deauth)
+// Các vector lưu các mục tiêu tấn công
 std::vector<int> attack_targets_24;  // cho 2.4GHz (channel < 36)
 std::vector<int> attack_targets_5;   // cho 5GHz (channel >= 36)
 
-// Các vector lưu các mục tiêu beacon (dùng để “nhái” beacon)
+// Các vector lưu các mục tiêu beacon
 std::vector<int> beacon_targets_24;  // cho 2.4GHz
 std::vector<int> beacon_targets_5;   // cho 5GHz
 
@@ -97,7 +97,6 @@ static int currentBeaconIndex5  = 0;
 
 // --------------------------------------------------
 // Hàm cập nhật LED theo trạng thái (non‑blocking)
-// (Phần LED giữ nguyên như cũ)
 void updateLEDs() {
   static unsigned long lastToggleTime = 0;
   static bool ledState = false;
@@ -175,7 +174,7 @@ int scanNetworks() {
 }
 
 // --------------------------------------------------
-// Parse request HTTP: trả về URL (đã trim khoảng trắng)
+// Parse request HTTP: trả về URL
 String parseRequest(String request) {
   if (request.length() == 0) return "";
   int path_start = request.indexOf(' ') + 1;
@@ -226,7 +225,6 @@ String makeResponse(int code, String content_type) {
 
 // --------------------------------------------------
 // Giao diện Web (HTML) – sử dụng CSS hiện đại, responsive
-// Hiển thị danh sách các mạng quét được; nếu SSID rỗng thì hiển thị "Hidden"
 void handleRoot(WiFiClient &client) {
   String response = makeResponse(200, "text/html") +
   R"(
