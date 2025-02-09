@@ -40,7 +40,7 @@ volatile DeviceState currentState = STATE_IDLE;  // volatile vì được truy c
 const unsigned long BLINK_INTERVAL_IDLE  = 1500;
 const unsigned long BLINK_INTERVAL_ATTACK  = 1000;
 const unsigned long BLINK_INTERVAL_SCANNING = 100;
-const unsigned long BLINK_INTERVAL_BEACON   = 1000; // ví dụ: LED nhấp nháy theo chế độ beacon
+const unsigned long BLINK_INTERVAL_BEACON   = 1000;
 
 // --------------------------------------------------
 // Cấu trúc lưu trữ kết quả quét WiFi
