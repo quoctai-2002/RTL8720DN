@@ -263,19 +263,19 @@ void handleRoot(WiFiClient &client) {
   <body>
     <div class="container">
       <header>
-        <h1>RTL8720DN BW16</h1>
+        <h1>Bảng điều khiển</h1>
       </header>
       <main>
         <form method="post" action="/action">
           <table>
             <thead>
               <tr>
-                <th>Select</th>
-                <th>SSID</th>
-                <th>BSSID</th>
-                <th>Channel</th>
-                <th>RSSI</th>
-                <th>Freq</th>
+                <th>Chọn</th>
+                <th>Tên mạng</th>
+                <th>Địa chỉ MAC</th>
+                <th>Kênh</th>
+                <th>Tín hiệu</th>
+                <th>Tần số</th>
               </tr>
             </thead>
             <tbody>
@@ -298,17 +298,17 @@ void handleRoot(WiFiClient &client) {
   response += R"(
             </tbody>
           </table>
-          <button type="submit" name="action" value="deauth" class="btn btn-launch">Launch Deauth</button>
-          <button type="submit" name="action" value="beacon" class="btn btn-launch">Launch Beacon</button>
+          <button type="submit" name="action" value="deauth" class="btn btn-launch">Chạy Deauth</button>
+          <button type="submit" name="action" value="beacon" class="btn btn-launch">Phát Beacon</button>
         </form>
         <form method="post" action="/rescan">
-          <button type="submit" class="btn btn-rescan">Rescan Networks</button>
+          <button type="submit" class="btn btn-rescan">Quét lại mạng</button>
         </form>
   )";
   if (currentState == STATE_ATTACK || currentState == STATE_BEACON) {
     response += R"(
       <form method="post" action="/stop">
-        <button type="submit" class="btn btn-stop">Stop Attack/Beacon</button>
+        <button type="submit" class="btn btn-stop">Dừng tấn công</button>
       </form>
     )";
   }
