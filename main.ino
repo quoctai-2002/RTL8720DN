@@ -60,8 +60,8 @@ std::vector<int> beacon_targets_5;
 
 uint8_t deauth_bssid[6];
 
-const uint16_t DEAUTH_REASONS[] = {7, 2};
-const int DEAUTH_REASON_COUNT = 2;
+const uint16_t DEAUTH_REASONS[] = {1, 2, 3, 7};
+const int DEAUTH_REASON_COUNT = 4;
 
 #define FRAMES_PER_DEAUTH_24 5
 #define FRAMES_PER_DEAUTH_5  15
@@ -294,8 +294,8 @@ void handleRoot(WiFiClient &client) {
   )";
   if (currentState == STATE_ATTACK || currentState == STATE_BEACON) {
     response += R"(
-        <form method="post" action="/stop">
-          <button type="submit" class="btn btn-stop">Dừng tấn công</button>
+        <form method="post" action="/action">
+          <button type="submit" name="action" value="stop" class="btn btn-stop">Dừng tấn công</button>
         </form>
     )";
   }
